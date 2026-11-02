@@ -978,14 +978,17 @@ async function onEditorAliasGenerate() {
             return;
         }
         const aliases = parseAliasAnswer(answer, ch?.name);
-        if (aliases.length === 0) {
-            // Empty answer: keep the field untouched, tell the user.
-            if (typeof toastr !== 'undefined' && typeof toastr.info === 'function') toastr.info(localize('charAliasEmptyToast'), MODULE_NAME);
-            return;
-        }
         if (getEditorChid() !== capturedChid) {
             // The user switched editor targets mid-flight: discard the answer without touching any field.
             console.log(LOG_PREFIX, 'editor alias generation discarded: editor target changed');
+            return;
+        }
+        if (aliases.length === 0) {
+            // Empty answer: write the emptiness through the same change path as manual editing (it normalizes the field,
+            // mirrors it into the carrier and triggers the edit-mode autosave), then tell the user.
+            console.log(LOG_PREFIX, 'editor alias generation produced nothing: writing emptiness through the change path');
+            $('#stgcmodes_char_aliases').val('').trigger('change');
+            if (typeof toastr !== 'undefined' && typeof toastr.info === 'function') toastr.info(localize('charAliasEmptyToast'), MODULE_NAME);
             return;
         }
         $('#stgcmodes_char_aliases').val(aliases.join(', ')).trigger('change');
