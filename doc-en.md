@@ -1,20 +1,20 @@
 # Group Chat Modes (Smart / Alias)
 
-**Group Chat Modes (Smart / Alias)** is a third-party UI extension for SillyTavern that adds two extra group-reply modes to group chats: **Smart** (reply strategy 4) and **Alias** (reply strategy 5). Smart picks its responders through a four-level cascade — from a direct name-or-alias hit to a single quiet LLM request that decides who was addressed by a sign and who has a reason to join on their own — and posts a short note into the chat when nobody fits. Alias relies purely on the alias table and never calls the LLM. This documentation covers version 1.1.0.
+**Group Chat Modes (Smart / Alias)** is a third-party UI extension for SillyTavern that adds two extra group-reply modes to group chats: **Smart** (reply strategy 4) and **Alias** (reply strategy 5). Smart picks its responders through a four-level cascade — from a direct name-or-alias hit to a single quiet LLM request that decides who was addressed by a sign and who has a reason to join on their own — and posts a short note into the chat when nobody fits. Alias relies purely on the characters' aliases and never calls the LLM. This documentation covers version 1.2.0.
 
 ## Overview
 
-The extension does not patch the SillyTavern core. It adds two options — **Smart** (value 4) and **Alias** (value 5) — to the "reply strategy" dropdown in the group panel. The core knows nothing about these values, so groups set to either new mode are handled entirely by the extension: it watches chat events and decides itself which members answer a user message. A responders-cap widget is added to the group panel as well. The extension's own settings live under **Extensions → Group Chat Modes (Smart / Alias)**: the master switch, director instructions, context depth, cascade level toggles, the "(nobody)" note, the default responders cap, and the alias table.
+The extension does not patch the SillyTavern core. It adds two options — **Smart** (value 4) and **Alias** (value 5) — to the "reply strategy" dropdown in the group panel. The core knows nothing about these values, so groups set to either new mode are handled entirely by the extension: it watches chat events and decides itself which members answer a user message. A responders-cap widget is added to the group panel as well. The extension's own settings live under **Extensions → Group Chat Modes (Smart / Alias)**: the master switch, director instructions, context depth, cascade level toggles, the "(nobody)" note, and the default responders cap.
 
 ## Modes
 
 **Smart (strategy 4)** — the "thinking" mode. Every user message goes through the four-level cascade (next section): local matching by names and aliases first; only when that finds nothing is a single quiet LLM request sent, looking for both indirect addresses and characters with a reason to join. As soon as responders are found, the cascade stops. If no one fits, the chat receives the "(nobody)" note (when that setting is on).
 
-**Alias (strategy 5)** — the no-LLM mode. The user message is checked against the alias table: every character's name is always checked, plus any listed signals (nicknames, shortenings, forms of address). Only the characters with a match respond; the LLM is never called at all.
+**Alias (strategy 5)** — the no-LLM mode. The user message is checked against the character aliases: every character's name is always checked, plus any listed signals (nicknames, shortenings, forms of address). Only the characters with a match respond; the LLM is never called at all.
 
 ## The level cascade (Smart mode)
 
-- **Level 1: direct hit (name or alias)** — local matching of the message against the alias table: the character name always counts, plus the signals. If members are found, they answer immediately and the cascade stops. No LLM call.
+- **Level 1: direct hit (name or alias)** — local matching of the message against the character aliases: the character name always counts, plus the signals. If members are found, they answer immediately and the cascade stops. No LLM call.
 - **Level 2: indirect address (by attribute)** — when no direct match exists, the quiet LLM request asks who was addressed by a sign — a profession, a role, a look ("Hey, baker!") — instead of the name.
 - **Level 3: who would join the conversation** — the same single request also asks who has their own reason to support the conversation right now, even if nobody addressed them directly.
 - **„Nobody“ note in chat** — when Smart matched nobody, the extension pushes a short user message into the chat: `(Nobody joined the conversation.)` (in a Russian UI — `(Никто не вступил в разговор.)`); one `localize()` call picks the language. No LLM call.
@@ -30,23 +30,30 @@ How many members may answer one user message is limited by a "ceiling":
 
 When more members matched than the ceiling allows, the extras are trimmed: the matched order is preserved and the trimmed members are logged to the console.
 
-## Alias table
+## Character card aliases
 
-The **Member aliases** setting in the extension panel opens a two-column table — "Member" and "Alias words (comma separated)" — one row per character:
+Aliases live in the character card itself — in the field `character.data.extensions.st_gc_modes_aliases`, a single comma-separated string (for example, "Kir, Kira-chan, baker"). Storing them in the card survives page reloads and extension reinstalls, and the aliases remain part of the character file: the card is exported and carried over together with them.
 
-| Member | Alias words (comma separated) |
-| --- | --- |
-| Kira | Kir, Kira-chan, baker |
+The advanced character editor has a **"Name aliases"** field (RU: «Заменители имени (алиасы)») — a one-line comma-separated input with a **"Generate with LLM"** button next to it. The button sends the character description to the active API in one quiet request, parses the answer, and puts the parsed alias list into the field. Nothing is saved automatically: saving stays with the regular Save button, so the list can be edited first. In "new character" mode the field is empty and the generate button stays disabled until the character exists and is saved. The field itself (manual save) works regardless of the extension master switch; only generation is gated by it.
 
-How it works:
+There is no alias table in the extension settings panel anymore. The panel keeps: the master switch, the repository link, the director instructions, the context depth, the level 2/3/4 toggles, and the default responders cap — no alias widgets.
 
-- the character name is always checked by itself — you never need to list it among the signals;
-- the signal field holds comma-separated extra signals: nicknames, shortenings, forms of address (the empty-field placeholder reads "Kir, Kira-chan, baker");
-- a single-word signal requires the whole token: "Kir" matches "Kir" but not "Kirill";
+In the group panel, next to the per-group responders cap widget, a warning box is shown whenever the group uses Smart (4) or Alias (5). It carries the line "aliases from character card fields are used", then either the list of members without aliases ("No aliases: <names>") or the line "All members have aliases."; the **"Fill with LLM"** button sits at the end of the box: it generates aliases sequentially for every member without aliases, with progress toasts ("Generating aliases: 2 of 5…"); each generated list is written into that character's card and the character is saved programmatically right away; a member whose generation or save fails is skipped with its own error toast; the run ends with a summary toast. The button is disabled while a run is in flight.
+
+The resolution order is the same for Smart and Alias:
+
+- the character card field is checked first;
+- when the card field is empty, the old extension-setting aliases (`aliasSignals` stored under `extension_settings['st-gc-modes']`) serve as a fallback so previously configured groups keep working; this fallback is read-only;
+- the character's full name is always checked on top of any aliases — unchanged.
+
+For new setups, put aliases in the character card. The legacy storage is deprecated: nothing writes to it anymore, and its data is not deleted — the fallback merely reads it.
+
+The matching mechanics are unchanged:
+
+- the character name is always checked by itself — you never need to list it among the aliases;
 - a multi-word signal matches only when all of its words are present in the message;
-- new characters are prefilled with the name plus the first three letters of the name;
-- the table is used by both modes — Smart and Alias alike;
-- the **Update list** button rebuilds the table from the current character list.
+- a single-word signal requires the whole token: "Kir" matches "Kir" but not "Kirill";
+- alias signals work in both modes — Smart and Alias alike.
 
 ## Settings panel
 
@@ -59,7 +66,7 @@ The panel opens under **Extensions → Group Chat Modes (Smart / Alias)**.
 5. **Level 3: who would join the conversation** — on by default.
 6. **„Nobody“ note in chat** — on by default.
 7. **Responders cap (default)** — default 2; options 2, 3, 4, 5, "none" (0).
-8. **Member aliases** — the alias table described above, with its columns "Member" and "Alias words (comma separated)" and the **Update list** button.
+8. There are no alias widgets in the panel anymore: aliases are set in the advanced character editor (see "Character card aliases"), and a group's alias state is shown in the warning box in the group panel.
 9. **Responders cap (this group)** — in the group panel; options "(default)", 2, 3, 4, 5, "none" — takes priority over the default.
 10. The top of the panel carries a link to the repository — <https://github.com/DarkLeopard/st-gc-modes> — captioned "Details in README".
 
@@ -86,13 +93,14 @@ Do not pick anyone out of politeness. If several fit, list all. Answer format: p
 - After a SillyTavern core update, the DOM injection may stop working until the extension is patched (element ids change).
 - A reasoning model may return an empty answer to the quiet request — the extension then treats it as "nobody"; the fix is prompt tuning.
 - Aliases match whole words, not substrings.
+- In "new character" mode, aliases are unavailable until the first save (the field is empty, the generate button is disabled) — a consequence of keeping them in the character card.
 - The quiet request sends recent chat context to the active API — a privacy and token-cost consideration.
 
 ## Installation, update, reinstall
 
 **Installation.** In SillyTavern open **Extensions → Install extension** (the puzzle icon / "Install extension" button), paste the repo URL `https://github.com/DarkLeopard/st-gc-modes`, choose **for me only**, and reload the page (F5).
 
-**Update.** Open **Extensions → Manage extensions**: the extension row shows an update button (download icon, hover hint "Update available") when the repo has a newer version. The update applies immediately, no confirmation prompt. Auto-update is off for version 1.1.0 — click the button manually. If no button appears, remove the extension and install it again by the same UI path: the settings (enabled state, aliases, instructions) survive a reinstall because they are stored in user settings, not in the extension folder.
+**Update.** Open **Extensions → Manage extensions**: the extension row shows an update button (download icon, hover hint "Update available") when the repo has a newer version. The update applies immediately, no confirmation prompt. Auto-update is off for version 1.2.0 — click the button manually; the update procedure itself is unchanged. After the update the alias table is gone, while the old alias value from the settings is kept and still works as the legacy fallback (see "Character card aliases"). If no button appears, remove the extension and install it again by the same UI path: the settings (enabled state, instructions, legacy alias value) survive a reinstall because they are stored in user settings, not in the extension folder, and the character-card aliases stay intact as well.
 
 **Reinstall / clean install.** Remove the old folder through the Extensions UI (**Uninstall** / **Remove**), then install by URL again.
 

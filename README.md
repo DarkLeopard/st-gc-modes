@@ -6,6 +6,13 @@ alias matching first, then one quiet "director" LLM request — and posts a
 "(nobody)" note when no one fits. Alias is pure alias-signal matching with no
 LLM calls at all.
 
+Aliases live in the character card itself
+(`character.data.extensions.st_gc_modes_aliases`, a single comma-separated
+string): the advanced character editor has a **Name aliases** field with a
+**Generate with LLM** button. The alias table in the extension settings panel
+is gone; groups in Smart or Alias show a warning box with a bulk
+**Fill with LLM** button that generates and saves aliases card by card.
+
 ## Documentation
 
 * [Русская документация](doc-ru.md)
