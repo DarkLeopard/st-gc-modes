@@ -5,7 +5,7 @@
 // ES2022, plain ES module, no build step, no npm dependencies.
 // Core SillyTavern is never patched: the extension only injects DOM and listens to events.
 
-import { eventSource, event_types, Generate, generateRaw, addOneMessage, chat, characters, name1, saveChatConditional, is_send_press, saveSettingsDebounced, this_chid, getRequestHeaders, getOneCharacter } from '../../../../script.js';
+import { eventSource, event_types, Generate, generateRaw, addOneMessage, deleteMessage, chat, characters, name1, saveChatConditional, is_send_press, saveSettingsDebounced, this_chid, getRequestHeaders, getOneCharacter } from '../../../../script.js';
 import { getMessageTimeStamp } from '../../../RossAscends-mods.js';
 import { extension_settings, getContext } from '../../../extensions.js';
 import { groups, selected_group, editGroup, is_group_generating } from '../../../group-chats.js';
@@ -250,7 +250,9 @@ function parseSignalList(text) {
 
 // ---- state ----
 
-// Queued { messageId, chatId, sendDate } items waiting for their cascade to run (FIFO, serialized).
+// Queued cascade items waiting for their cascade to run (FIFO, serialized): { kind, messageId, chatId, sendDate }.
+// kind documents the item type: 'message' (default — a rendered user message, messageId set) or 'empty'
+// (empty-continue signal enqueued by onEmptyPersonaMessage: messageId is null, there is no message behind the item).
 const pendingCascades = [];
 let cascadeScheduled = false; // a runner timeout is pending (or in its first tick)
 let isCascadeActive = false;  // a cascade is currently awaiting inside runCascadeFor
@@ -262,7 +264,7 @@ let editorAliasesObserver = null; // the single MutationObserver switching the e
 let editorAliasAnchorLogged = false; // the single one-time "editor alias block anchor missing" debug line
 let editorAliasGenerateBusy = false; // an editor alias generation request is currently in flight
 let bulkAliasFillBusy = false; // a bulk "Fill with LLM" run over the group alias widget is currently in flight
-const cascadeStats = { messagesSeen: 0, cascadesRun: 0, level1Hits: 0, quietCalls: 0, generationsPushed: 0, notes: 0 };
+const cascadeStats = { messagesSeen: 0, cascadesRun: 0, level1Hits: 0, quietCalls: 0, generationsPushed: 0, notes: 0, personaEmptyRemoved: 0 };
 
 // ---- group helpers ----
 
@@ -412,9 +414,34 @@ function memberSignalsMatch(tokenSet, signals) {
     return false;
 }
 
+// ---- persona-name helpers ----
+
+/** Whether the given name/signal text is the user's persona name: both sides trimmed, comparison lowercased, exact
+ * equality only. False when name1 is empty/whitespace (an unnamed persona must match nothing) and when the strings
+ * merely contain each other — only full equality counts.
+ * @param {string} text Name or alias-signal candidate to test (may be undefined). @returns {boolean} True when text equals name1. */
+function isPersonaNamed(text) {
+    const persona = String(name1 ?? '').trim().toLowerCase();
+    if (persona.length === 0) return false;
+    return String(text ?? '').trim().toLowerCase() === persona;
+}
+
+/** Whether the message is the empty persona message the core fallback pushes on an empty send in groups with
+ * strategies 4/5: rendered user message named name1 with only whitespace text, never the level4 note.
+ * Messages named differently than name1 are left as-is on purpose (they are not this defect).
+ * @param {object} message Chat message object (may be null/undefined). @returns {boolean} True for the empty persona message. */
+function isEmptyPersonaMessage(message) {
+    if (!message || message.is_user !== true || message.is_system !== false) return false;
+    if (message.extra?.[NOTE_FLAG]) return false;
+    if (collapseWhitespace(String(message.mes ?? '')).length !== 0) return false;
+    return String(message.name ?? '') === String(name1);
+}
+
 // ---- level 1 (direct/alias matching) ----
 
-/** level1: members whose name or alias signals appear in the user message, in group member order.
+/** level1: members whose name or alias signals appear in the user message, in group member order. The user's
+ * persona is never a candidate: persona-named members are skipped entirely and persona-named alias signals are
+ * filtered out, so matching can never "answer for me".
  * @param {string} inputText Raw user message text. @param {string[]} memberList Enabled member avatar filenames.
  * @returns {string[]} Matched member avatar filenames. */
 function level1Matches(inputText, memberList) {
@@ -424,7 +451,11 @@ function level1Matches(inputText, memberList) {
     for (const avatar of memberList) {
         const index = findCharacterIndex(avatar);
         if (index === -1) continue;
-        const signals = effectiveSignals(avatar, String(characters[index]?.name ?? ''));
+        const memberName = String(characters[index]?.name ?? '');
+        // the user's persona is never a candidate (never "answer for me"): skip a persona-named member,
+        // drop persona-named alias signals out of the checked set
+        if (isPersonaNamed(memberName)) continue;
+        const signals = effectiveSignals(avatar, memberName).filter(signal => !isPersonaNamed(signal));
         if (signals.length > 0 && memberSignalsMatch(tokenSet, signals)) matched.push(avatar);
     }
     return matched;
@@ -447,7 +478,8 @@ function buildQuietQuestion() {
 }
 
 /** Builds the single-string director prompt: instructions, optional single-criterion line, participant list
- * (name, aka signals, collapsed description), recent chat transcript and the question.
+ * (name, aka signals, collapsed description; persona-named members and persona-named aka signals are hidden so
+ * the persona is never a pickable candidate), recent chat transcript (persona messages unchanged) and the question.
  * @param {string} inputText Raw user message text. @param {string[]} memberList Enabled member avatar filenames.
  * @returns {string} Prompt text. */
 function buildQuietPrompt(inputText, memberList) {
@@ -469,7 +501,10 @@ function buildQuietPrompt(inputText, memberList) {
             continue;
         }
         const memberName = String(characters[index]?.name ?? '');
-        const signals = (memberSignals(avatar, memberName) ?? []).filter(signal => typeof signal === 'string' && signal.trim().length > 0);
+        // the user's persona is never a candidate (never "answer for me")
+        if (isPersonaNamed(memberName)) continue;
+        // the user's persona is never a candidate (never "answer for me")
+        const signals = (memberSignals(avatar, memberName) ?? []).filter(signal => typeof signal === 'string' && signal.trim().length > 0 && !isPersonaNamed(signal));
         const description = collapseWhitespace(String(characters[index]?.description ?? '')).slice(0, DESC_LIMIT) || '(no description)';
         let line = `- Name: ${memberName}`;
         if (signals.length > 0) {
@@ -905,7 +940,9 @@ async function saveCharacterAliases(chid, aliasString) {
 // ---- parsing the model answer ----
 
 /** Parses the director reply into a chosen avatar list (in model order, deduped) and a list of unrecognized raw
- * tokens; "nobody" answers (NONE_TOKENS) collapse to an empty list.
+ * tokens; "nobody" answers (NONE_TOKENS) collapse to an empty list, and persona-named tokens are dropped silently
+ * (they must never become "unknown name" toast noise). Persona-named members and persona-named aka signals never
+ * resolve to a member.
  * @param {string} answer Raw model answer. @param {string[]} memberList Enabled member avatar filenames.
  * @returns {{chosen: string[], unknown: string[]}} Chosen avatars and unresolved tokens. */
 function parseQuietAnswer(answer, memberList) {
@@ -913,10 +950,12 @@ function parseQuietAnswer(answer, memberList) {
     const unknown = [];
     const rawParts = String(answer ?? '').split(/[,;\n\r]+/u).map(part => part.trim()).filter(part => part.length > 0);
 
-    // Drop tokens that are themselves a NONE_TOKEN ("none", "никто", "no one", ...). Surrounding punctuation
-    // and other non-letters are stripped first, so "None." or "None:" collapse to nobody too.
+    // Drop tokens that are themselves a NONE_TOKEN ("none", "никто", "no one", ...) and tokens equal to the user's
+    // persona name: dropped silently exactly like the NONE_TOKENs, so a persona-like label never surfaces as
+    // "unknown name" toast noise. Surrounding punctuation and other non-letters are stripped first, so
+    // "None." or "None:" collapse to nobody too.
     const stripEdges = (part) => part.replace(/^[^\p{L}\p{N}'-]+|[^\p{L}\p{N}'-]+$/gu, '');
-    let tokens = rawParts.filter(part => !NONE_TOKENS.has(stripEdges(part).toLowerCase()));
+    let tokens = rawParts.filter(part => !NONE_TOKENS.has(stripEdges(part).toLowerCase()) && !isPersonaNamed(stripEdges(part)));
     // When a single remaining token merely STARTS with a NONE_TOKEN word ("никто не подходит"), treat as nobody.
     if (tokens.length === 1) {
         const lower = tokens[0].toLowerCase();
@@ -925,19 +964,23 @@ function parseQuietAnswer(answer, memberList) {
     }
     if (tokens.length === 0) return { chosen, unknown };
 
-    // Exact-match index: lowercased name and lowercased table signals -> avatar.
+    // Exact-match index: lowercased name and lowercased table signals -> avatar. Persona-named members are skipped
+    // entirely and persona-named aka signals are not registered, so a persona-like label never resolves to a member.
     const exactIndex = new Map();
     const labels = [];
     for (const avatar of memberList) {
         const index = findCharacterIndex(avatar);
         if (index === -1) continue;
         const memberName = String(characters[index]?.name ?? '');
+        // the user's persona is never a candidate (never "answer for me")
+        if (isPersonaNamed(memberName)) continue;
         if (memberName.length > 0) {
             exactIndex.set(memberName.toLowerCase(), avatar);
             labels.push({ label: memberName, avatar, name: memberName });
         }
         for (const signal of (memberSignals(avatar, memberName) ?? [])) {
-            if (typeof signal === 'string' && signal.trim().length > 0) {
+            // the user's persona is never a candidate (never "answer for me")
+            if (typeof signal === 'string' && signal.trim().length > 0 && !isPersonaNamed(signal)) {
                 exactIndex.set(signal.toLowerCase(), avatar);
                 labels.push({ label: signal, avatar, name: memberName });
             }
@@ -995,8 +1038,11 @@ async function pushNobodyNote() {
 /** USER_MESSAGE_RENDERED handler. Returns immediately when the master switch is off; otherwise it validates the
  * rendered user message, then — never awaiting — queues a cascade item and schedules the detached runner. Nothing
  * here may await generation: while the core wrapper is still executing, is_group_generating is true and any nested
- * Generate call would be silently ignored.
- * @param {number} idx Chat array INDEX of the rendered message (not the message object). */
+ * Generate call would be silently ignored. The empty persona message the core fallback pushes on an empty send
+ * (strategies 4/5) never queues a normal cascade: it is delegated to onEmptyPersonaMessage and its promise is
+ * returned so the emit chain awaits the removal (name !== name1 messages are left as-is and take the normal path).
+ * @param {number} idx Chat array INDEX of the rendered message (not the message object).
+ * @returns {Promise<void>|undefined} The onEmptyPersonaMessage promise for the empty persona message, otherwise undefined. */
 function onUserMessageRendered(idx) {
     try {
         if (!isEnabled()) return; // Master switch off: never react to messages.
@@ -1010,11 +1056,43 @@ function onUserMessageRendered(idx) {
         if (!group) return;
         const strategy = Number(group.activation_strategy);
         if (strategy !== STRATEGY_SMART && strategy !== STRATEGY_ALIAS) return;
+        // Empty persona message (core fallback on an empty send, strategies 4/5): do NOT queue a normal cascade —
+        // delegate to the remover and return its promise so the emit chain awaits the removal.
+        if (isEmptyPersonaMessage(message)) return onEmptyPersonaMessage(idx, message);
         pendingCascades.push({ messageId: idx, chatId: String(getContext()?.chatId ?? ''), sendDate: String(message.send_date ?? '') });
         enqueueCascadeRunner();
         // Return immediately — the cascade runs detached.
     } catch (err) {
         console.error(LOG_PREFIX, 'user message hook failed:', err);
+    }
+}
+
+/** Handles the empty persona message the core group fallback pushed on an empty send (strategies 4/5): removes the
+ * message from the chat and, on Smart, re-enters the cascade as an empty-continue signal; on Alias nothing listens,
+ * so it stays silent. Captures chatId/sendDate/strategy BEFORE deleting (the message leaves the chat inside
+ * deleteMessage). A failed removal returns without queueing anything — defense in depth: a failed removal must
+ * not cascade.
+ * @param {number} idx Chat array INDEX of the empty persona message. @param {object} message The empty persona message object.
+ * @returns {Promise<void>} Resolves after the removal attempt and any re-queue. */
+async function onEmptyPersonaMessage(idx, message) {
+    // Captured BEFORE deleting: the message object is gone from the chat once deleteMessage ran.
+    const chatId = String(getContext()?.chatId ?? '');
+    const sendDate = String(message.send_date ?? '');
+    const strategy = Number(getActiveGroup()?.activation_strategy ?? -1);
+    cascadeStats.personaEmptyRemoved += 1;
+    console.log(LOG_PREFIX, 'empty persona message removed (core fallback for strategies 4/5)');
+    try {
+        await deleteMessage(Number(idx), undefined, false, true);
+    } catch (err) {
+        console.error(LOG_PREFIX, 'empty persona message removal failed:', err);
+        return; // a failed removal must not cascade
+    }
+    if (strategy === STRATEGY_SMART) {
+        console.log(LOG_PREFIX, 'empty input on Smart: re-entering cascade as empty-continue signal');
+        pendingCascades.push({ kind: 'empty', messageId: null, chatId, sendDate });
+        enqueueCascadeRunner();
+    } else {
+        console.log(LOG_PREFIX, 'empty input on Alias: no signals, staying silent');
     }
 }
 
@@ -1071,8 +1149,9 @@ function clearTextboxDefensively() {
 
 /** Runs the full cascade for one queued item: idle wait, master-switch re-check, re-validation, dedupe, level1
  * (direct/alias) matching, optional quiet request (level2/level3), level4 note and sequential forced member
- * invocation.
- * @param {{messageId: number|string, chatId: string, sendDate: string}} item Queued cascade item. */
+ * invocation. 'empty' items (Smart empty-continue, see onEmptyPersonaMessage) skip the entire message
+ * re-validation — there is no message behind them — and run with empty input; every other check stays identical.
+ * @param {{kind: 'message'|'empty', messageId: number|string|null, chatId: string, sendDate: string}} item Queued cascade item. */
 async function runCascadeFor(item) {
     // 1) Wait until the group chat is idle (wrapper finished, nothing being sent).
     if (!(await waitGroupIdle(IDLE_WAIT_TIMEOUT, IDLE_WAIT_INTERVAL))) {
@@ -1099,16 +1178,24 @@ async function runCascadeFor(item) {
         console.log(LOG_PREFIX, 'cascade dropped: reply strategy changed');
         return;
     }
+    // 'empty' items carry no message at all: the entire message re-validation block below does not apply
+    // (no chat lookup, no is_user/send_date guard, no NOTE_FLAG guard); every other check stays identical.
+    const isEmptyCascade = item.kind === 'empty';
     const index = Number(item.messageId);
-    const message = chat[index];
-    if (!message || message.is_user !== true || String(message.send_date ?? '') !== String(item.sendDate ?? '')) {
-        console.log(LOG_PREFIX, 'cascade dropped: queued message changed (stale or swipe)');
-        return;
+    const message = isEmptyCascade ? null : chat[index];
+    if (!isEmptyCascade) {
+        if (!message || message.is_user !== true || String(message.send_date ?? '') !== String(item.sendDate ?? '')) {
+            console.log(LOG_PREFIX, 'cascade dropped: queued message changed (stale or swipe)');
+            return;
+        }
+        if (message.extra?.[NOTE_FLAG]) return;
     }
-    if (message.extra?.[NOTE_FLAG]) return;
 
-    // 3) Cheap dedupe: mark processed (bounded FIFO Set keyed by chat, index and send date).
-    const dedupeKey = `${currentChatId}::${index}::${String(message.send_date ?? '')}`;
+    // 3) Cheap dedupe: mark processed (bounded FIFO Set keyed by chat, index and send date; 'empty' items are keyed
+    // by chat, the literal 'empty' marker and send date instead of the message index).
+    const dedupeKey = isEmptyCascade
+        ? `${currentChatId}::empty::${String(item.sendDate ?? '')}`
+        : `${currentChatId}::${index}::${String(message.send_date ?? '')}`;
     if (processedKeys.has(dedupeKey)) {
         console.log(LOG_PREFIX, 'cascade skipped: duplicate event for the same message');
         return;
@@ -1118,9 +1205,10 @@ async function runCascadeFor(item) {
 
     // 4) Debug stats object for this run.
     const mode = strategy === STRATEGY_ALIAS ? 'alias' : 'smart';
-    const inputText = String(message.mes ?? '');
+    const inputText = isEmptyCascade ? '' : String(message.mes ?? '');
     lastCascade = {
         startedAt: Date.now(), finishedAt: null, mode: mode, input: inputText,
+        kind: isEmptyCascade ? 'empty-continue' : 'message',
         level1HitNames: [], quietCalls: 0, quietRaw: '', parsedNames: [], unknownNames: [],
         chosenNames: [], trimmedByCeiling: [], notePushed: false, invocations: [], error: null,
     };
