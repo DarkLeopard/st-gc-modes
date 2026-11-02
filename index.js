@@ -5,7 +5,7 @@
 // ES2022, plain ES module, no build step, no npm dependencies.
 // Core SillyTavern is never patched: the extension only injects DOM and listens to events.
 
-import { eventSource, event_types, Generate, generateRaw, addOneMessage, chat, characters, name1, saveChatConditional, is_send_press, saveSettingsDebounced } from '../../../../script.js';
+import { eventSource, event_types, Generate, generateRaw, addOneMessage, chat, characters, name1, saveChatConditional, is_send_press, saveSettingsDebounced, this_chid } from '../../../../script.js';
 import { getMessageTimeStamp } from '../../../RossAscends-mods.js';
 import { extension_settings, getContext } from '../../../extensions.js';
 import { groups, selected_group, editGroup, is_group_generating } from '../../../group-chats.js';
@@ -60,6 +60,13 @@ const UI_TEXT = {
         noteNobody: '(Nobody joined the conversation.)',
         enabledLabel: 'Enabled', repoLink: 'Details in README',
         aliasPlaceholder: 'Kir, Kira-chan, baker',
+        charAliasLabel: 'Name aliases', charAliasGenButton: 'Generate with LLM',
+        charAliasInputTitle: 'Comma-separated forms of this name (nicknames, shortenings, forms of address). The full name is always checked too. Saved into the character card (data.extensions) and survives page reloads.',
+        charAliasGenTitle: 'The model reads the character description and returns a list of alias forms (Russian and English where appropriate).',
+        charAliasGenBusyToast: 'Generating aliases…',
+        charAliasEmptyToast: 'st-gc-modes: the model returned an empty alias list',
+        charAliasFailedToast: 'st-gc-modes: alias generation failed',
+        charAliasGenUnavailable: 'Available after the character is created and saved: aliases live in the character card.',
         toggleOffToast: 'st-gc-modes disabled: Smart/Alias options hidden', toggleOnToast: 'st-gc-modes enabled',
         ttEnabled: 'Master switch. When off, the extension removes its Smart/Alias options and the per-group cap widget and stops reacting to messages; the panel itself stays available.',
         ttInstructions: 'System instructions for the quiet "director" LLM request used by Smart mode when no direct alias match. The model reads the participant list and the recent chat.',
@@ -89,6 +96,13 @@ const UI_TEXT = {
         noteNobody: '(Никто не вступил в разговор.)',
         enabledLabel: 'Включено', repoLink: 'Подробности — в README',
         aliasPlaceholder: 'Кир, Кирочка, печница',
+        charAliasLabel: 'Заменители имени (алиасы)', charAliasGenButton: 'Сгенерировать через LLM',
+        charAliasInputTitle: 'Формы имени через запятую (клички, сокращения, обращения). Само имя проверяется всегда. Хранится в карточке персонажа (data.extensions) и переживает перезагрузку страницы.',
+        charAliasGenTitle: 'Модель читает описание персонажа и возвращает список форм имени (рус и англ, где уместно).',
+        charAliasGenBusyToast: 'Генерирую алиасы…',
+        charAliasEmptyToast: 'st-gc-modes: модель вернула пустой список алиасов',
+        charAliasFailedToast: 'st-gc-modes: генерация алиасов не удалась',
+        charAliasGenUnavailable: 'Доступно после создания и сохранения персонажа: алиасы живут в его карточке.',
         toggleOffToast: 'st-gc-modes выключен: пункты Smart/Alias скрыты', toggleOnToast: 'st-gc-modes включён',
         ttEnabled: 'Главный выключатель. Когда выключено, расширение убирает свои пункты Smart/Alias и виджет лимита группы и перестаёт реагировать на сообщения; сама панель остаётся доступной.',
         ttInstructions: 'Системные инструкции тихого «режиссёрского» запроса к LLM в режиме Smart, когда прямого совпадения по алиасам нет. Модель читает список участников и последние сообщения.',
@@ -237,6 +251,9 @@ let lastCascade = null;       // debug stats object of the most recent cascade r
 let injectLogged = false;     // the single one-time "options injected" debug line
 let removeLogged = false;     // the single one-time "options removed (disabled)" debug line
 let aliasPrefillLogged = false; // the single one-time "alias table prefilled" debug line
+let editorAliasesObserver = null; // the single MutationObserver switching the editor alias field between edit/create modes
+let editorAliasAnchorLogged = false; // the single one-time "editor alias block anchor missing" debug line
+let editorAliasGenerateBusy = false; // an editor alias generation request is currently in flight
 const cascadeStats = { messagesSeen: 0, cascadesRun: 0, level1Hits: 0, quietCalls: 0, generationsPushed: 0, notes: 0 };
 
 // ---- group helpers ----
@@ -496,6 +513,240 @@ async function quietLevelRequest(inputText, memberList) {
     }
     if (lastCascade) lastCascade.quietRaw = trimmed.slice(0, QUIET_RAW_LIMIT);
     return trimmed;
+}
+
+// ---- character-card aliases (editor + bulk fill) ----
+
+// Shared instruction block for the quiet alias-generation request (editor generate button; reused by the bulk fill later).
+const ALIASES_PROMPT_INSTRUCTIONS = [
+    'Read the character description below.',
+    'Produce a list of name aliases: forms of address, shortenings, nicknames, diminutives,',
+    'and well-known alternative forms of the name (Russian and English variants where appropriate).',
+    'Answer with a single line of comma-separated items only. No explanations, no numbering, no quotes.',
+    'Between 2 and 8 items. Never include the exact full name itself.',
+];
+
+/** Builds the alias-generation prompt for one character: the shared instruction lines plus two final lines carrying
+ * the character name and its description; when data.description is empty the collapsed personality and scenario
+ * fields are used instead, and null is returned when there is nothing readable at all (caller shows the failed toast).
+ * @param {object} ch Character object (may be sparse). @returns {string|null} Raw generateRaw prompt text, or null. */
+function buildAliasPrompt(ch) {
+    let text = collapseWhitespace(ch?.data?.description);
+    if (text.length === 0) {
+        const personality = collapseWhitespace(ch?.personality ?? ch?.data?.personality);
+        const scenario = collapseWhitespace(ch?.scenario ?? ch?.data?.scenario);
+        text = [personality, scenario].filter(part => part.length > 0).join(': ');
+    }
+    if (text.length === 0) return null;
+    return [...ALIASES_PROMPT_INSTRUCTIONS, `Character name: ${ch?.name}`, `Description: ${text}`].join('\n');
+}
+
+/** Parses a raw alias-generation answer into a clean list: split on commas/semicolons/newlines/pipes, trim, drop
+ * empties, drop duplicates case-insensitively (same dedupe approach as parseSignalList), drop any item equal to the
+ * character name case-insensitively, cap at 8 items.
+ * @param {string} answer Raw model answer. @param {string} name Character full name to exclude.
+ * @returns {string[]} Up to 8 cleaned alias strings, original order. */
+function parseAliasAnswer(answer, name) {
+    const out = [];
+    const seen = new Set();
+    const nameLower = String(name ?? '').trim().toLowerCase();
+    for (const piece of String(answer ?? '').split(/[,;\n\r;|]+/u)) {
+        const trimmed = piece.trim();
+        if (trimmed.length === 0) continue;
+        const key = trimmed.toLowerCase();
+        if (seen.has(key)) continue;
+        if (nameLower.length > 0 && key === nameLower) continue;
+        seen.add(key);
+        out.push(trimmed);
+    }
+    return out.slice(0, 8);
+}
+
+/** Reads the alias comma-string stored in a character card (data.extensions.st_gc_modes_aliases).
+ * @param {object} ch Character object (may be null). @returns {string} The stored comma string, or '' when absent. */
+function readCardAliases(ch) {
+    return String(ch?.data?.extensions?.st_gc_modes_aliases ?? '');
+}
+
+/** Resolves the character the editor currently works on: this_chid (Number()-ed, it may arrive as a string) while
+ * the form is in edit mode, else null.
+ * @returns {number|null} Index into characters, or null outside edit mode / without a valid id. */
+function getEditorChid() {
+    if ($('#form_create').attr('actiontype') !== 'editcharacter') return null;
+    const chid = Number(this_chid);
+    return Number.isInteger(chid) ? chid : null;
+}
+
+/** Idempotently injects the character-editor alias widgets: the hidden extensions carrier input on #form_create
+ * (its JSON value is deep-merged into char.data.extensions by the server on save), the visible block (label + text
+ * field + LLM generate button) after the creator-notes row, one MutationObserver switching edit/create handling on
+ * the persistent form, and the input/change/click wiring. Reruns are no-ops; never throws. */
+function ensureEditorAliasesField() {
+    try {
+        const form = $('#form_create');
+        if (form.length === 0) return; // Page not loaded yet; retried by init and every context event.
+        // Hidden carrier: must always exist on the form (even without the visible block), so it is created first.
+        if ($('#stgcmodes_char_extensions').length === 0) {
+            form.append($('<input>').attr({ id: 'stgcmodes_char_extensions', type: 'hidden' }));
+        }
+        // One observer on the persistent form: core flips actiontype between editcharacter/createcharacter.
+        if (editorAliasesObserver === null) {
+            editorAliasesObserver = new MutationObserver(() => {
+                try {
+                    syncEditorAliasesMode();
+                } catch (err) {
+                    console.error(LOG_PREFIX, 'editor alias mode observer failed:', err);
+                }
+            });
+            editorAliasesObserver.observe(form.get(0), { attributes: true, attributeFilter: ['actiontype'] });
+        }
+        if ($('#stgcmodes_char_aliases').length > 0) return; // Already injected (idempotent re-entry).
+        const block = $('<div>').attr('id', 'stgcmodes_char_alias_block').addClass('flex1');
+        const label = $('<label>').attr({ for: 'stgcmodes_char_aliases', title: localize('charAliasInputTitle') });
+        label.append($('<span>').text(localize('charAliasLabel')));
+        const row = $('<div>').addClass('flex-container flexnowrap');
+        const input = $('<input>').attr({ id: 'stgcmodes_char_aliases', type: 'text', autocomplete: 'off', spellcheck: 'false', placeholder: localize('aliasPlaceholder') }).addClass('text_pole flex1');
+        const genButton = $('<div>').attr({ id: 'stgcmodes_char_alias_gen', title: localize('charAliasGenTitle') }).addClass('menu_button');
+        genButton.append($('<i>').addClass('fa-solid fa-wand-magic-sparkles'));
+        genButton.append($('<span>').text(localize('charAliasGenButton')));
+        row.append(input).append(genButton);
+        block.append(label).append(row);
+        const anchor = $('#creator_notes_textarea').closest('div.flex-container.flexnowrap');
+        if (anchor.length > 0) {
+            anchor.after(block);
+        } else {
+            // Layout anchor missing: keep the field functional by appending it to the form; log this once.
+            form.append(block);
+            if (!editorAliasAnchorLogged) {
+                editorAliasAnchorLogged = true;
+                console.log(LOG_PREFIX, 'editor alias block: creator notes anchor missing, appended to the form');
+            }
+        }
+        input.on('input', syncEditorAliasesHiddenOnly).on('change', syncEditorAliasesFromInput);
+        genButton.on('click', onEditorAliasGenerate);
+        syncEditorAliasesMode();
+        console.log(LOG_PREFIX, 'editor alias field injected into the character form');
+    } catch (err) {
+        console.error(LOG_PREFIX, 'editor alias field injection failed:', err);
+    }
+}
+
+/** input-event variant of the editor sync: mirrors the typed text into the hidden extensions carrier WITHOUT
+ * rewriting the visible field — rewriting mid-typing would jump the caret and eat trailing commas/spaces; the visible
+ * value normalization happens on change (blur) via syncEditorAliasesFromInput instead. */
+function syncEditorAliasesHiddenOnly() {
+    try {
+        const field = $('#stgcmodes_char_aliases');
+        if (field.length === 0) return;
+        setHiddenExtensions(parseSignalList(String(field.val() ?? '')).join(', '));
+    } catch (err) {
+        console.error(LOG_PREFIX, 'editor alias hidden sync failed:', err);
+    }
+}
+
+/** Normalizes the editor alias text field (parseSignalList joined with ', '), writes the normalized value back into
+ * the field only when it differs (no caret jumps while typing) and mirrors the result into the hidden extensions
+ * carrier so the next form save submits a fresh st_gc_modes_aliases value. */
+function syncEditorAliasesFromInput() {
+    try {
+        const field = $('#stgcmodes_char_aliases');
+        if (field.length === 0) return;
+        const raw = String(field.val() ?? '');
+        const normalized = parseSignalList(raw).join(', ');
+        if (raw !== normalized) field.val(normalized);
+        setHiddenExtensions(normalized);
+    } catch (err) {
+        console.error(LOG_PREFIX, 'editor alias field sync failed:', err);
+    }
+}
+
+/** Writes the value the next form save will submit as the extensions body field: a JSON object with the
+ * st_gc_modes_aliases key only (the server deep-merges it into char.data.extensions). The key is written even when
+ * the string is empty, so clearing the field erases a previously stored list.
+ * @param {string} aliasString Comma-separated alias string (may be empty). */
+function setHiddenExtensions(aliasString) {
+    $('#stgcmodes_char_extensions').val(JSON.stringify({ st_gc_modes_aliases: String(aliasString ?? '') }));
+}
+
+/** Applies the current editor mode to the alias widgets. Edit mode: the hidden carrier gets name="extensions" (so
+ * FormData submits it), the field is populated from the currently loaded card and the generate button enabled state
+ * follows the master switch. Create mode: the name attribute is REMOVED (core appends its own extensions field in
+ * create mode and a duplicate would break the server parse), the field is cleared and the button stays disabled
+ * with an explanatory title. */
+function syncEditorAliasesMode() {
+    const field = $('#stgcmodes_char_aliases');
+    const genButton = $('#stgcmodes_char_alias_gen');
+    if ($('#form_create').attr('actiontype') === 'editcharacter') {
+        $('#stgcmodes_char_extensions').attr('name', 'extensions');
+        const chid = getEditorChid();
+        const card = Number.isInteger(chid) ? characters[chid] : null;
+        const aliases = readCardAliases(card);
+        if (field.length > 0 && String(field.val() ?? '') !== aliases) field.val(aliases);
+        genButton.prop('disabled', !isEnabled());
+        genButton.attr('title', localize('charAliasGenTitle'));
+    } else {
+        $('#stgcmodes_char_extensions').removeAttr('name');
+        if (field.length > 0 && String(field.val() ?? '') !== '') field.val('');
+        genButton.prop('disabled', true);
+        genButton.attr('title', localize('charAliasGenUnavailable'));
+    }
+}
+
+/** Click handler for the editor "Generate with LLM" alias button: one quiet generateRaw request over the character
+ * card text, parsed into the field (which syncs the hidden carrier through the same change path as manual editing).
+ * Gated by the master switch, edit mode and the busy flag (no parallel runs); every failure stays a toast and the
+ * button is restored in finally — nothing thrown reaches the editor.
+ * @returns {Promise<void>} Resolves once the run finished. */
+async function onEditorAliasGenerate() {
+    if (!isEnabled()) return;
+    if ($('#form_create').attr('actiontype') !== 'editcharacter') return; // Button is disabled in create mode anyway.
+    if (editorAliasGenerateBusy) return;
+    const chid = getEditorChid();
+    const ch = Number.isInteger(chid) ? characters[chid] : null;
+    if (!ch) {
+        if (typeof toastr !== 'undefined' && typeof toastr.error === 'function') toastr.error(localize('charAliasFailedToast'), MODULE_NAME);
+        return;
+    }
+    editorAliasGenerateBusy = true;
+    try {
+        if (typeof toastr !== 'undefined' && typeof toastr.info === 'function') toastr.info(localize('charAliasGenBusyToast'), MODULE_NAME);
+        $('#stgcmodes_char_alias_gen').prop('disabled', true);
+        const prompt = buildAliasPrompt(ch);
+        if (prompt === null) {
+            console.log(LOG_PREFIX, 'editor alias generation skipped: nothing readable in the character card');
+            if (typeof toastr !== 'undefined' && typeof toastr.error === 'function') toastr.error(localize('charAliasFailedToast'), MODULE_NAME);
+            return;
+        }
+        let answer = '';
+        try {
+            answer = await generateRaw({ prompt, systemPrompt: '' });
+        } catch (err) {
+            console.error(LOG_PREFIX, 'editor alias generation failed:', err);
+            if (typeof toastr !== 'undefined' && typeof toastr.error === 'function') toastr.error(localize('charAliasFailedToast'), MODULE_NAME);
+            return;
+        }
+        const aliases = parseAliasAnswer(answer, ch?.name);
+        if (aliases.length === 0) {
+            // Empty answer: keep the field untouched, tell the user.
+            if (typeof toastr !== 'undefined' && typeof toastr.info === 'function') toastr.info(localize('charAliasEmptyToast'), MODULE_NAME);
+            return;
+        }
+        $('#stgcmodes_char_aliases').val(aliases.join(', ')).trigger('change');
+        console.log(LOG_PREFIX, `editor aliases generated: ${aliases.length} items`);
+    } finally {
+        editorAliasGenerateBusy = false;
+        $('#stgcmodes_char_alias_gen').prop('disabled', false); // restore in finally, per handler contract
+    }
+}
+
+/** CHARACTER_EDITOR_OPENED handler: core fires it at the end of the editor populate function, so the card behind
+ * this_chid is fully loaded and the alias field can be synced to it. */
+function onCharacterEditorOpened() {
+    try {
+        syncEditorAliasesMode();
+    } catch (err) {
+        console.error(LOG_PREFIX, 'character editor opened handling failed:', err);
+    }
 }
 
 // ---- parsing the model answer ----
@@ -1073,6 +1324,8 @@ function renderSettingsPanel() {
             removeInjected();
             if (typeof toastr !== 'undefined') toastr.info(localize('toggleOffToast'), 'st-gc-modes');
         }
+        // The editor alias field stays injected; its gen button follows the switch (off → disabled, on → per mode).
+        syncEditorAliasesMode();
         console.log(LOG_PREFIX, `enabled toggled: ${settings.enabled}`);
     });
 
@@ -1204,6 +1457,10 @@ function defineDebugHook() {
  * widgets and prefills alias signals when the active group runs one of our strategies. Never throws. */
 function onContextEvents() {
     try {
+        // The editor alias field stays injected and functional even when the master switch is off
+        // (decision: injecting is harmless; only LLM generation and the group cascade are gated).
+        ensureEditorAliasesField();
+        syncEditorAliasesMode();
         if (!isEnabled()) {
             removeInjected();
             return;
@@ -1219,14 +1476,15 @@ function onContextEvents() {
     }
 }
 
-/** Registers the event listeners used by this extension: the three cheap context hooks and the
- * USER_MESSAGE_RENDERED cascade entry point. */
+/** Registers the event listeners used by this extension: the three cheap context hooks, the USER_MESSAGE_RENDERED
+ * cascade entry point and the CHARACTER_EDITOR_OPENED alias-field sync. */
 function registerEventListeners() {
     try {
         eventSource.on(event_types.APP_READY, onContextEvents);
         eventSource.on(event_types.CHAT_CHANGED, onContextEvents);
         eventSource.on(event_types.GROUP_UPDATED, onContextEvents);
         eventSource.on(event_types.USER_MESSAGE_RENDERED, onUserMessageRendered);
+        eventSource.on(event_types.CHARACTER_EDITOR_OPENED, onCharacterEditorOpened);
     } catch (err) {
         console.error(LOG_PREFIX, 'failed to register event listeners:', err);
     }
@@ -1240,6 +1498,11 @@ function initModule() {
         registerEventListeners();
         injectStrategyOptions();
         renderSettingsPanel();
+        try {
+            ensureEditorAliasesField();
+        } catch (err) {
+            console.error(LOG_PREFIX, 'editor alias field setup failed:', err);
+        }
         defineDebugHook();
         console.log(LOG_PREFIX, 'extension loaded');
     } catch (err) {
