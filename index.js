@@ -1,7 +1,7 @@
 // st-gc-modes — SillyTavern third-party UI extension.
 // Adds two extra group-reply modes to group chats:
-//   4 = Smart — direct alias matching (У1), then one quiet director request (У2/У3), then a "(nobody)" note in chat (У4);
-//   5 = Alias — pure alias-signal matching (У1) with no LLM request at all.
+//   4 = Smart — direct alias matching (level1), then one quiet director request (level2/level3), then a "(nobody)" note in chat (level4);
+//   5 = Alias — pure alias-signal matching (level1) with no LLM request at all.
 // ES2022, plain ES module, no build step, no npm dependencies.
 // Core SillyTavern is never patched: the extension only injects DOM and listens to events.
 
@@ -29,7 +29,7 @@ const WORD_RE = /\p{L}[\p{L}\p{M}\p{N}'-]*/gu;
 // Lowercased tokens that mean "no one" in a quiet-model reply (English + Russian).
 const NONE_TOKENS = new Set(['none', 'no one', 'nobody', 'noone', 'нико', 'никто', 'никого', 'никем', 'никуда', 'никому']);
 
-// Marker stored on message.extra for the У4 "nobody" note pushed by this extension.
+// Marker stored on message.extra for the level4 "nobody" note pushed by this extension.
 const NOTE_FLAG = 'st_gc_modes_note';
 
 // Bounds and delays (all timeouts in milliseconds).
@@ -49,27 +49,61 @@ const DESC_LIMIT = 200;            // description slice shown to the director pr
 const UI_TEXT = {
     en: {
         panelTitle: 'Smart / Alias group modes', panelInstructions: 'Smart: director instructions',
-        panelDepth: 'Context depth {n} (last messages)', panelL2: 'У2: indirect address (profession/attribute)',
-        panelL3: 'У3: motivation to join', panelNote: 'У4: "(nobody)" note in chat',
+        panelDepth: 'Context depth {n} (last messages)', panelL2: 'Level 2: indirect address (by attribute)',
+        panelL3: 'Level 3: who would join the conversation', panelNote: '"Nobody" note in chat',
         panelCeiling: 'Responders cap (default)', ceilingNone: 'none',
-        aliasTitle: 'Alias signals (comma separated)', aliasRefresh: 'Update list',
-        columnName: 'Character', columnSignals: 'Signals',
+        aliasTitle: 'Member aliases', aliasRefresh: 'Update list',
+        columnName: 'Member', columnSignals: 'Alias words (comma separated)',
         groupCeilingLabel: 'Responders cap (this group)', groupCeilingDefault: '(default)', groupCeilingNone: 'none',
         unknownNamesToast: 'st-gc-modes: unknown name in reply: {names}',
         quietFailedToast: 'st-gc-modes: quiet request failed, skipping levels 2/3',
         noteNobody: '(Nobody joined the conversation.)',
+        enabledLabel: 'Enabled', repoLink: 'Details in README',
+        aliasPlaceholder: 'Kir, Kira-chan, baker',
+        toggleOffToast: 'st-gc-modes disabled: Smart/Alias options hidden', toggleOnToast: 'st-gc-modes enabled',
+        ttEnabled: 'Master switch. When off, the extension removes its Smart/Alias options and the per-group cap widget and stops reacting to messages; the panel itself stays available.',
+        ttInstructions: 'System instructions for the quiet "director" LLM request used by Smart mode when no direct alias match. The model reads the participant list and the recent chat.',
+        ttDepth: 'How many of the last chat messages the director request sees (1-50).',
+        ttL2: 'Ask the quiet request who is addressed indirectly, by a sign from their description (profession, role, look) instead of their name.',
+        ttL3: 'Ask the quiet request who would have their own reason to join the conversation right now.',
+        ttNote: 'When Smart matches nobody, push a short user message into the chat so the silence is visible.',
+        ttCeiling: 'Default limit on how many members one cascade may invoke (2-5; none = unlimited).',
+        ttGroupCeiling: 'Per-group responders cap; it takes priority over the default value.',
+        ttRefresh: 'Rebuild the alias table from the current character list.',
+        ttAlias: 'Alias words used instead of the name: nicknames, shortenings, forms of address. Used by both Smart and Alias modes.',
+        hintInstructions: 'Read by the quiet director request in Smart mode when signals do not match.',
+        hintDepth: 'Recent messages the director sees.',
+        hintCeiling: 'Max members answering one user message.',
+        hintAlias: 'Aliases work in Smart and Alias modes; the character name is always checked too.',
     },
     ru: {
         panelTitle: 'Smart / Alias режимы группы', panelInstructions: 'Smart: инструкции режиссёра',
-        panelDepth: 'Глубина контекста {n} (последние сообщения)', panelL2: 'У2: косвенное обращение (профессия/признак)',
-        panelL3: 'У3: мотивация вступить', panelNote: 'У4: заметка "(никто)" в чате',
+        panelDepth: 'Глубина контекста {n} (последние сообщения)', panelL2: 'Уровень 2: косвенный вызов (по признаку)',
+        panelL3: 'Уровень 3: кто мог бы поддержать разговор', panelNote: 'Заметка „никто не откликнулся“ в чате',
         panelCeiling: 'Лимит отвечающих (по умолчанию)', ceilingNone: 'нет',
-        aliasTitle: 'Сигналы-алиасы (через запятую)', aliasRefresh: 'Обновить список',
-        columnName: 'Персонаж', columnSignals: 'Сигналы',
+        aliasTitle: 'Заменители имени (алиасы) участников', aliasRefresh: 'Обновить список',
+        columnName: 'Участник', columnSignals: 'Сигналы (через запятую)',
         groupCeilingLabel: 'Лимит отвечающих (группа)', groupCeilingDefault: '(по умолчанию)', groupCeilingNone: 'нет',
         unknownNamesToast: 'st-gc-modes: неизвестные имена в ответе: {names}',
         quietFailedToast: 'st-gc-modes: тихий запрос не удался, уровни 2/3 пропущены',
         noteNobody: '(Никто не вступил в разговор.)',
+        enabledLabel: 'Включено', repoLink: 'Подробности — в README',
+        aliasPlaceholder: 'Кир, Кирочка, печница',
+        toggleOffToast: 'st-gc-modes выключен: пункты Smart/Alias скрыты', toggleOnToast: 'st-gc-modes включён',
+        ttEnabled: 'Главный выключатель. Когда выключено, расширение убирает свои пункты Smart/Alias и виджет лимита группы и перестаёт реагировать на сообщения; сама панель остаётся доступной.',
+        ttInstructions: 'Системные инструкции тихого «режиссёрского» запроса к LLM в режиме Smart, когда прямого совпадения по алиасам нет. Модель читает список участников и последние сообщения.',
+        ttDepth: 'Сколько последних сообщений чата видит режиссёрский запрос (1-50).',
+        ttL2: 'Спросить у тихого запроса, к кому обращаются косвенно — по признаку из описания (профессия, роль, внешность), а не по имени.',
+        ttL3: 'Спросить у тихого запроса, у кого сейчас есть своя причина поддержать разговор.',
+        ttNote: 'Если в Smart не совпал никто, отправить в чат короткое сообщение пользователя, чтобы тишина была заметна.',
+        ttCeiling: 'Сколько участников максимум может вызвать один каскад по умолчанию (2-5; «нет» = без лимита).',
+        ttGroupCeiling: 'Лимит отвечающих для этой группы; приоритет выше общего значения.',
+        ttRefresh: 'Пересобрать таблицу алиасов по текущему списку персонажей.',
+        ttAlias: 'Слова-обращения вместо имени: клички, сокращения, формы обращения. Работают в режимах Smart и Alias.',
+        hintInstructions: 'Их читает тихий режиссёрский запрос в режиме Smart, когда сигналы не сработали.',
+        hintDepth: 'Сколько последних сообщений видит режиссёр.',
+        hintCeiling: 'Максимум участников на одно сообщение пользователя.',
+        hintAlias: 'Алиасы работают в Smart и Alias; само имя персонажа проверяется всегда.',
     },
 };
 
@@ -93,7 +127,7 @@ function localize(key) {
 
 // ---- settings ----
 
-// Default instructions for the Smart "director" quiet request (У2/У3). Editable in the panel.
+// Default instructions for the Smart "director" quiet request (level2/level3). Editable in the panel.
 const DEFAULT_SMART_INSTRUCTIONS = [
     'You are the group-chat director choosing which characters join the conversation.',
     'You receive: participant list (name + short description), recent chat, and the last user message.',
@@ -105,16 +139,23 @@ const DEFAULT_SMART_INSTRUCTIONS = [
 
 // Module settings: merged one level deep from defaults on init.
 const DEFAULT_SETTINGS = {
+    enabled: true,            // master switch: when false, injected UI is removed and hooks stop reacting
     smart_instructions: DEFAULT_SMART_INSTRUCTIONS,
     context_depth: 10,        // integer 1..50, how many last chat messages go into a quiet request
-    level2Enabled: true,      // У2 indirect address
-    level3Enabled: true,      // У3 motivation to join
-    nobodyNote: true,         // У4 "(nobody)" note in chat
+    level2Enabled: true,      // level2 (indirect address)
+    level3Enabled: true,      // level3 (motivation to join)
+    nobodyNote: true,         // level4 "(nobody)" note in chat
     ceiling: 2,               // default responders cap: 2 | 3 | 4 | 5 | 0 (= none/unlimited)
     aliasSignals: {},         // avatar filename -> array of signal strings (editable in panel)
 };
 
 let settings = null;
+
+/** Master switch guard used by every hook and injection path; the settings panel itself stays available when disabled.
+ * @returns {boolean} True when the extension is enabled and may inject its UI and react to messages. */
+function isEnabled() {
+    return !!settings?.enabled;
+}
 
 /** Ensures extension_settings[MODULE_NAME] exists and merges missing default keys (one level deep, cloning object
  * defaults to avoid shared references), saving once when something was added.
@@ -194,6 +235,7 @@ let isCascadeActive = false;  // a cascade is currently awaiting inside runCasca
 const processedKeys = new Set(); // bounded FIFO Set of dedupe keys `${chatId}::${idx}::${send_date}`
 let lastCascade = null;       // debug stats object of the most recent cascade run
 let injectLogged = false;     // the single one-time "options injected" debug line
+let removeLogged = false;     // the single one-time "options removed (disabled)" debug line
 let aliasPrefillLogged = false; // the single one-time "alias table prefilled" debug line
 const cascadeStats = { messagesSeen: 0, cascadesRun: 0, level1Hits: 0, quietCalls: 0, generationsPushed: 0, notes: 0 };
 
@@ -266,8 +308,8 @@ function memberSignals(avatar, _name) {
     return Array.isArray(entry) ? entry : null;
 }
 
-/** Effective signal list for У1: the alias table entry unioned with the character's full name, which is always
- * checked implicitly. Deduplicated case-insensitively.
+/** Effective signal list for level1 (direct/alias matching): the alias table entry unioned with the character's full
+ * name, which is always checked implicitly. Deduplicated case-insensitively.
  * @param {string} avatar Avatar filename. @param {string} name Character name.
  * @returns {string[]} Signals (may be single- or multi-word strings). */
 function effectiveSignals(avatar, name) {
@@ -340,7 +382,7 @@ function ensureSignalPrefill(groupMembers) {
 
 // ---- level 1 (direct/alias matching) ----
 
-/** У1: members whose name or alias signals appear in the user message, in group member order.
+/** level1: members whose name or alias signals appear in the user message, in group member order.
  * @param {string} inputText Raw user message text. @param {string[]} memberList Enabled member avatar filenames.
  * @returns {string[]} Matched member avatar filenames. */
 function level1Matches(inputText, memberList) {
@@ -356,7 +398,7 @@ function level1Matches(inputText, memberList) {
     return matched;
 }
 
-// ---- quiet request (У2/У3 smart part) ----
+// ---- quiet request (level2/level3 smart part) ----
 
 /** Builds the two-sentence closing question for the director prompt depending on enabled levels.
  * @returns {string} The Question: line content. */
@@ -425,7 +467,7 @@ function buildQuietPrompt(inputText, memberList) {
     return blocks.join('\n\n');
 }
 
-/** Runs ONE quiet (raw) LLM request implementing the У2/У3 checks for Smart mode: generateRaw goes to the active
+/** Runs ONE quiet (raw) LLM request implementing the level2/level3 checks for Smart mode: generateRaw goes to the active
  * API without a preset. Failures and empty answers are treated as "nobody" inputs downstream, never thrown.
  * @param {string} inputText Raw user message text. @param {string[]} memberList Enabled member avatar filenames.
  * @returns {Promise<string>} Trimmed model answer (may be empty). */
@@ -521,7 +563,7 @@ function parseQuietAnswer(answer, memberList) {
     return { chosen, unknown };
 }
 
-// ---- nobody note (У4) ----
+// ---- nobody note (level4) ----
 
 /** Pushes the localized "(nobody)" note into the chat as a user message flagged with extra[NOTE_FLAG].
  * addOneMessage does not emit USER_MESSAGE_RENDERED, so no cascade recursion happens; the flag and the exact-text
@@ -546,12 +588,14 @@ async function pushNobodyNote() {
 
 // ---- cascade runner ----
 
-/** USER_MESSAGE_RENDERED handler. Validates the rendered user message, then — never awaiting — queues a cascade
- * item and schedules the detached runner. Nothing here may await generation: while the core wrapper is still
- * executing, is_group_generating is true and any nested Generate call would be silently ignored.
+/** USER_MESSAGE_RENDERED handler. Returns immediately when the master switch is off; otherwise it validates the
+ * rendered user message, then — never awaiting — queues a cascade item and schedules the detached runner. Nothing
+ * here may await generation: while the core wrapper is still executing, is_group_generating is true and any nested
+ * Generate call would be silently ignored.
  * @param {number} idx Chat array INDEX of the rendered message (not the message object). */
 function onUserMessageRendered(idx) {
     try {
+        if (!isEnabled()) return; // Master switch off: never react to messages.
         const message = chat[Number(idx)];
         if (!message) return;
         cascadeStats.messagesSeen += 1;
@@ -621,8 +665,9 @@ function clearTextboxDefensively() {
     }
 }
 
-/** Runs the full cascade for one queued item: idle wait, re-validation, dedupe, У1, optional quiet request (У2/У3),
- * У4 note and sequential forced member invocation.
+/** Runs the full cascade for one queued item: idle wait, master-switch re-check, re-validation, dedupe, level1
+ * (direct/alias) matching, optional quiet request (level2/level3), level4 note and sequential forced member
+ * invocation.
  * @param {{messageId: number|string, chatId: string, sendDate: string}} item Queued cascade item. */
 async function runCascadeFor(item) {
     // 1) Wait until the group chat is idle (wrapper finished, nothing being sent).
@@ -630,6 +675,9 @@ async function runCascadeFor(item) {
         console.warn(LOG_PREFIX, 'cascade dropped: group still busy (idle wait timeout)');
         return;
     }
+
+    // 1b) Defense in depth: drop the cascade before any Generate/note side effects when the master switch is off.
+    if (!isEnabled()) return;
 
     // 2) Re-validate the queued item against the current state; drop silently stale ones.
     const currentChatId = String(getContext()?.chatId ?? '');
@@ -677,7 +725,7 @@ async function runCascadeFor(item) {
     try {
         const members = enabledMembersOf(group);
 
-        // У1 — direct signals.
+        // level1 — direct signals.
         const level1 = level1Matches(inputText, members);
         lastCascade.level1HitNames = level1.map(avatarToName);
 
@@ -686,13 +734,13 @@ async function runCascadeFor(item) {
             cascadeStats.level1Hits += 1;
             const chosen = applyCeiling(level1, group);
             lastCascade.chosenNames = chosen.map(avatarToName);
-            console.log(LOG_PREFIX, 'У1 hit (no quiet request)');
+            console.log(LOG_PREFIX, 'level1 hit (no quiet request)');
             await invokeMembers(chosen, item);
             return;
         }
 
         if (mode === 'alias') {
-            // Alias only has У1; empty means silence — never a note.
+            // Alias only has level1; empty means silence — never a note.
             if (level1.length > 0) {
                 cascadeStats.level1Hits += 1;
                 const chosen = applyCeiling(level1, group);
@@ -705,7 +753,7 @@ async function runCascadeFor(item) {
             return;
         }
 
-        // Smart, У1 empty: one quiet request covering the enabled levels, or nobody path.
+        // Smart, level1 empty: one quiet request covering the enabled levels, or nobody path.
         let parsed = { chosen: [], unknown: [] };
         if (settings.level2Enabled || settings.level3Enabled) {
             const answer = await quietLevelRequest(inputText, members);
@@ -727,11 +775,11 @@ async function runCascadeFor(item) {
         const chosen = applyCeiling(parsed.chosen, group);
         lastCascade.chosenNames = chosen.map(avatarToName);
         if (chosen.length === 0) {
-            // Nobody path: Smart mode only, honor the У4 setting.
+            // Nobody path: Smart mode only, honor the level4 setting.
             if (settings.nobodyNote) {
                 await pushNobodyNote();
             } else {
-                console.log(LOG_PREFIX, 'nobody matched: staying silent (У4 note is disabled)');
+                console.log(LOG_PREFIX, 'nobody matched: staying silent (level4 note is disabled)');
             }
             return;
         }
@@ -801,11 +849,16 @@ async function invokeMember(chid) {
 // ---- injection (strategy options + per-group ceiling widget) ----
 
 /** Idempotently injects the Smart/Alias options into the group reply strategy select and installs the per-group
- * responders-cap widget right after the strategy select's flex container. Runs cheaply on every context hook and
- * retries automatically when the DOM is not ready yet; never throws. */
+ * responders-cap widget right after the strategy select's flex container. When the master switch is off, it removes
+ * the previously injected DOM instead of injecting. Runs cheaply on every context hook and retries automatically
+ * when the DOM is not ready yet; never throws. */
 function injectStrategyOptions() {
     let injected = false;
     try {
+        if (settings && !isEnabled()) {
+            removeInjected();
+            return;
+        }
         const select = $('#rm_group_activation_strategy');
         if (select.length === 0) return; // Page not loaded yet; retried on every APP_READY / CHAT_CHANGED / GROUP_UPDATED.
         if (select.find('option[value="4"]').length === 0) {
@@ -818,6 +871,7 @@ function injectStrategyOptions() {
         syncGroupCeilingWidget();
         if (injected && !injectLogged) {
             injectLogged = true;
+            removeLogged = false; // the next removal may log its one line again
             console.log(LOG_PREFIX, 'strategy options and responders-cap widget injected');
         }
     } catch (err) {
@@ -825,9 +879,26 @@ function injectStrategyOptions() {
     }
 }
 
+/** Removes the injected Smart/Alias options and the per-group responders-cap widget from the DOM; used whenever the
+ * master switch is off (context hooks and the panel toggle). Idempotent and wrapped in try/catch: never throws.
+ * Resets the one-time injection log flag so re-enabling logs the next injection again. */
+function removeInjected() {
+    try {
+        $('#rm_group_activation_strategy').find('option[value="4"],option[value="5"]').remove();
+        $('#stgcmodes_group_ceiling_wrap').remove();
+        injectLogged = false; // a re-enable must log the injection again
+        if (!removeLogged) {
+            removeLogged = true;
+            console.log(LOG_PREFIX, 'Smart/Alias options removed (disabled)');
+        }
+    } catch (err) {
+        console.error(LOG_PREFIX, 'injection removal failed:', err);
+    }
+}
+
 /** Creates and mounts the per-group responders-cap widget once, directly after the flex container that holds the
  * strategy select; the widget is only visible while the group panel is open because it lives in the same group
- * form container.
+ * form container. The widget label carries the ttGroupCeiling tooltip.
  * @param {JQuery} strategySelect The #rm_group_activation_strategy element. @returns {boolean} True when the widget was created by this call. */
 function injectCeilingWidget(strategySelect) {
     if ($('#stgcmodes_group_ceiling_wrap').length > 0) return false;
@@ -836,6 +907,7 @@ function injectCeilingWidget(strategySelect) {
     const wrap = $('<div>').attr('id', 'stgcmodes_group_ceiling_wrap').addClass('flex1 flexGap5');
     const label = $('<label>').attr('for', 'stgcmodes_group_ceiling').addClass('flexnowrap width100p whitespacenowrap');
     const labelText = $('<span>').attr('id', 'stgcmodes_group_ceiling_label').text(localize('groupCeilingLabel'));
+    label.attr('title', localize('ttGroupCeiling'));
     const valueSelect = $('<select>').attr('id', 'stgcmodes_group_ceiling');
     $('<option>').attr('value', 'default').text(localize('groupCeilingDefault')).appendTo(valueSelect);
     for (const value of ['2', '3', '4', '5']) {
@@ -893,9 +965,11 @@ function syncGroupCeilingWidget() {
 
 // ---- settings panel ----
 
-/** Renders the st-gc-modes settings drawer into the extensions settings container. The static HTML skeleton
- * contains no dynamic values: every label is filled through .text() from UI_TEXT and every dynamic value goes
- * through .val()/.prop(). */
+/** Renders the st-gc-modes settings drawer into the extensions settings container: master switch row, repo link,
+ * director instructions, context depth, the level2/level3/level4 checkboxes, the default responders cap and the
+ * alias table with its toolbar. Appends the static theme-safe CSS block to the head exactly once. The static HTML
+ * skeleton contains no dynamic values: every label is filled through .text() from UI_TEXT, every tooltip goes
+ * through .attr('title', ...) and every dynamic value goes through .val()/.prop(). */
 function renderSettingsPanel() {
     const target = $('#extensions_settings2').length > 0 ? $('#extensions_settings2') : $('#extensions_settings');
     if (target.length === 0) {
@@ -904,17 +978,52 @@ function renderSettingsPanel() {
     }
     if ($('#stgcmodes_content').length > 0) return; // Already rendered (idempotent).
 
+    // Theme-safe CSS, added once: all colors come from SillyTavern CSS variables, never from hex literals.
+    if ($('#stgcmodes_css').length === 0) {
+        $('head').append([
+            '<style id="stgcmodes_css">',
+            '.stgcmodes input[type="text"], .stgcmodes input[type="number"], .stgcmodes textarea, .stgcmodes select,',
+            '#stgcmodes_group_ceiling {',
+            '    background-color: var(--black30a);',
+            '    color: var(--SmartThemeBodyColor);',
+            '    border: 1px solid var(--SmartThemeBorderColor);',
+            '    border-radius: 5px;',
+            '}',
+            '.stgcmodes #stgcmodes_alias {',
+            '    border: 1px solid var(--SmartThemeBorderColor);',
+            '    border-radius: 10px;',
+            '    max-height: 260px;',
+            '    overflow-y: auto;',
+            '    padding: 5px;',
+            '    scrollbar-color: var(--grey30) transparent;',
+            '}',
+            '.stgcmodes input::placeholder { color: var(--grey30); opacity: 1; }',
+            '.stgcmodes .stgcmodes_toolbar { display: inline-flex; align-items: center; gap: 8px; flex-wrap: nowrap; white-space: nowrap; max-width: 100%; margin-top: 5px; }',
+            '.stgcmodes .stgcmodes_toolbar #stgcmodes_alias_refresh { flex: none; width: auto; white-space: nowrap; }',
+            '.stgcmodes .stgcmodes_toolbar #stgcmodes_alias_title { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }',
+            '.stgcmodes .stgcmodes_hint { opacity: 0.65; font-size: 11px; margin-top: 3px; }',
+            '.stgcmodes .stgcmodes_repo_row { margin: 4px 0 8px 0; font-size: 12px; }',
+            '.stgcmodes .stgcmodes_repo_row a { color: var(--SmartThemeAccentColor); text-decoration: none; }',
+            '.stgcmodes .stgcmodes_repo_row a:hover { text-decoration: underline; }',
+            '</style>',
+        ].join('\n'));
+    }
+
     const skeleton = [
         '<div class="stgcmodes"><div class="inline-drawer">',
         '<div class="inline-drawer-toggle inline-drawer-header"><b><span class="stgcmodes_i18n" data-key="panelTitle"></span></b><div class="inline-drawer-icon fa-solid fa-chevron-down expander"></div></div>',
         '<div class="inline-drawer-content" id="stgcmodes_content">',
+        '<label class="flex1 checkbox_label" id="stgcmodes_enabled_row" for="stgcmodes_enabled"><input id="stgcmodes_enabled" type="checkbox" /><span class="stgcmodes_i18n" data-key="enabledLabel"></span></label>',
+        '<div class="stgcmodes_repo_row"><a id="stgcmodes_repo_link" href="https://github.com/DarkLeopard/st-gc-modes" target="_blank" rel="noopener"><span class="stgcmodes_i18n" data-key="repoLink"></span></a></div>',
         '<div class="flex1">',
         '<label for="stgcmodes_instructions" class="stgcmodes_label"><span class="stgcmodes_i18n" data-key="panelInstructions"></span></label>',
         '<textarea id="stgcmodes_instructions" rows="6" spellcheck="false"></textarea>',
+        '<div class="stgcmodes_hint stgcmodes_i18n" data-key="hintInstructions"></div>',
         '</div>',
         '<div class="flex1">',
         '<label for="stgcmodes_depth" class="stgcmodes_label"><span id="stgcmodes_depth_label" class="stgcmodes_i18n" data-key="panelDepth"></span></label>',
         '<input id="stgcmodes_depth" type="number" min="1" max="50" step="1" />',
+        '<div class="stgcmodes_hint stgcmodes_i18n" data-key="hintDepth"></div>',
         '</div>',
         '<label class="flex1 checkbox_label" for="stgcmodes_l2"><input id="stgcmodes_l2" type="checkbox" /><span class="stgcmodes_i18n" data-key="panelL2"></span></label>',
         '<label class="flex1 checkbox_label" for="stgcmodes_l3"><input id="stgcmodes_l3" type="checkbox" /><span class="stgcmodes_i18n" data-key="panelL3"></span></label>',
@@ -922,12 +1031,10 @@ function renderSettingsPanel() {
         '<div class="flex1">',
         '<label for="stgcmodes_ceiling" class="stgcmodes_label"><span class="stgcmodes_i18n" data-key="panelCeiling"></span></label>',
         '<select id="stgcmodes_ceiling"></select>',
+        '<div class="stgcmodes_hint stgcmodes_i18n" data-key="hintCeiling"></div>',
         '</div>',
-        '<div class="flex1">',
-        '<span class="stgcmodes_i18n" data-key="aliasTitle"></span>',
-        '<div id="stgcmodes_alias"></div>',
-        '<button id="stgcmodes_alias_refresh" class="menu_button"><span class="stgcmodes_i18n" data-key="aliasRefresh"></span></button>',
-        '</div>',
+        '<div class="stgcmodes_toolbar"><span class="stgcmodes_i18n" data-key="aliasTitle" id="stgcmodes_alias_title"></span><button id="stgcmodes_alias_refresh" class="menu_button" type="button"><span class="stgcmodes_i18n" data-key="aliasRefresh"></span></button></div><div id="stgcmodes_alias"></div>',
+        '<div class="stgcmodes_hint stgcmodes_i18n" data-key="hintAlias"></div>',
         '</div></div></div>',
     ].join('\n');
 
@@ -936,6 +1043,36 @@ function renderSettingsPanel() {
     // Fill every localized label through .text() — never interpolated into HTML strings.
     $('#stgcmodes_content').find('.stgcmodes_i18n').each(function () {
         $(this).text(localize(String($(this).attr('data-key'))));
+    });
+
+    // Tooltips: title attributes only, filled once at render time — the panel renders once per page load.
+    $('#stgcmodes_enabled_row').attr('title', localize('ttEnabled'));
+    $('#stgcmodes_content').find('label[for="stgcmodes_instructions"]').attr('title', localize('ttInstructions'));
+    $('#stgcmodes_instructions').attr('title', localize('ttInstructions'));
+    $('#stgcmodes_depth_label').attr('title', localize('ttDepth'));
+    $('#stgcmodes_depth').attr('title', localize('ttDepth'));
+    $('#stgcmodes_content').find('label[for="stgcmodes_l2"]').attr('title', localize('ttL2'));
+    $('#stgcmodes_content').find('label[for="stgcmodes_l3"]').attr('title', localize('ttL3'));
+    $('#stgcmodes_content').find('label[for="stgcmodes_note"]').attr('title', localize('ttNote'));
+    $('#stgcmodes_content').find('label[for="stgcmodes_ceiling"]').attr('title', localize('ttCeiling'));
+    $('#stgcmodes_ceiling').attr('title', localize('ttCeiling'));
+    $('#stgcmodes_alias_title').attr('title', localize('ttAlias'));
+    $('#stgcmodes_alias_refresh').attr('title', localize('ttRefresh'));
+    $('#stgcmodes_alias').attr('title', localize('ttAlias'));
+
+    // Master switch: the checkbox reflects isEnabled(); the change handler keeps DOM and settings in sync.
+    $('#stgcmodes_enabled').prop('checked', isEnabled()).on('change', function () {
+        settings.enabled = !!$(this).prop('checked');
+        saveSettingsDebounced();
+        // Add/Remove DOM synchronously so the change is visible immediately.
+        if (settings.enabled) {
+            injectStrategyOptions();
+            if (typeof toastr !== 'undefined') toastr.info(localize('toggleOnToast'), 'st-gc-modes');
+        } else {
+            removeInjected();
+            if (typeof toastr !== 'undefined') toastr.info(localize('toggleOffToast'), 'st-gc-modes');
+        }
+        console.log(LOG_PREFIX, `enabled toggled: ${settings.enabled}`);
     });
 
     // Director instructions textarea.
@@ -957,7 +1094,7 @@ function renderSettingsPanel() {
         console.log(LOG_PREFIX, `context depth set to ${value}`);
     });
 
-    // Level checkboxes (У2 / У3 / У4).
+    // Level checkboxes (level2 / level3 / level4).
     for (const [id, key] of [['#stgcmodes_l2', 'level2Enabled'], ['#stgcmodes_l3', 'level3Enabled'], ['#stgcmodes_note', 'nobodyNote']]) {
         $(id).prop('checked', !!settings[key]).on('change', function () {
             settings[key] = !!$(this).prop('checked');
@@ -979,9 +1116,8 @@ function renderSettingsPanel() {
         console.log(LOG_PREFIX, `default responders cap set to ${raw === '0' ? 'none (unlimited)' : raw}`);
     });
 
-    // Alias signal table: bordered scroll box, rendered now (the list is small).
+    // Alias signal table: rendered now (the list is small); the box styling lives in the static CSS block.
     renderAliasTable();
-    $('#stgcmodes_alias').attr('style', 'border:1px solid var(--SmartThemeBorderColor, #999);border-radius:10px;max-height:260px;overflow-y:auto;padding:5px;');
     $('#stgcmodes_alias_refresh').on('click', renderAliasTable);
 }
 
@@ -994,7 +1130,8 @@ function updateDepthLabel() {
 
 /** Renders the alias signals table from the current character list, sorted case-insensitively by name. Rows for
  * characters without a table entry are prefilled (name + 3-letter stem) but saved only once at the end, and only
- * when at least one entry was added. All cell content goes through .text()/.val() — never dynamic innerHTML. */
+ * when at least one entry was added; every signal input carries the localized aliasPlaceholder hint. All cell
+ * content goes through .text()/.val()/.attr() — never dynamic innerHTML. */
 function renderAliasTable() {
     const box = $('#stgcmodes_alias');
     if (box.length === 0) return;
@@ -1025,7 +1162,7 @@ function renderAliasTable() {
 
         const row = $('<div>').addClass('stgcmodes_alias_row');
         const nameSpan = $('<span>').addClass('stgcmodes_alias_name').text(memberName).attr('title', memberName);
-        const input = $('<input>').attr({ type: 'text', autocomplete: 'off', spellcheck: 'false' }).addClass('stgcmodes_alias_input').val(signals.join(', '));
+        const input = $('<input>').attr({ type: 'text', autocomplete: 'off', spellcheck: 'false' }).addClass('stgcmodes_alias_input').val(signals.join(', ')).attr('placeholder', localize('aliasPlaceholder'));
         $(input).on('change', function () {
             settings.aliasSignals[avatar] = parseSignalList(String($(this).val() ?? ''));
             saveSettingsDebounced();
@@ -1061,10 +1198,15 @@ function defineDebugHook() {
 
 // ---- init ----
 
-/** Shared handler for context events (APP_READY, CHAT_CHANGED, GROUP_UPDATED): re-injects idempotently, syncs the
- * widgets and prefills alias signals when the active group runs one of our strategies. */
+/** Shared handler for context events (APP_READY, CHAT_CHANGED, GROUP_UPDATED): while the master switch is off it
+ * only removes previously injected DOM and skips everything else; otherwise it re-injects idempotently, syncs the
+ * widgets and prefills alias signals when the active group runs one of our strategies. Never throws. */
 function onContextEvents() {
     try {
+        if (!isEnabled()) {
+            removeInjected();
+            return;
+        }
         injectStrategyOptions();
         const group = getActiveGroup();
         if (group) {
