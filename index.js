@@ -65,10 +65,7 @@ const UI_TEXT = {
         charAliasEmptyToast: 'st-gc-modes: the model returned an empty alias list',
         charAliasFailedToast: 'st-gc-modes: alias generation failed',
         charAliasGenUnavailable: 'Available after the character is created and saved: aliases live in the character card.',
-        groupAliasWarning: 'Character aliases from the character card fields are used.',
         groupAliasMissing: 'No aliases: {names}',
-        groupAliasAllSet: 'All members have aliases.',
-        groupAliasLegacy: 'Aliases for {names} come from the legacy plugin storage',
         groupAliasFill: 'Fill with LLM',
         groupAliasFillTitle: 'For every member without aliases, the model reads their description and writes a generated alias list into their character card (saved immediately).',
         bulkProgressToast: 'Generating aliases: {current} of {total}…',
@@ -107,10 +104,7 @@ const UI_TEXT = {
         charAliasEmptyToast: 'st-gc-modes: модель вернула пустой список алиасов',
         charAliasFailedToast: 'st-gc-modes: генерация алиасов не удалась',
         charAliasGenUnavailable: 'Доступно после создания и сохранения персонажа: алиасы живут в его карточке.',
-        groupAliasWarning: 'Используются алиасы из полей персонажей.',
         groupAliasMissing: 'Без алиасов: {names}',
-        groupAliasAllSet: 'Все участники имеют алиасы.',
-        groupAliasLegacy: 'Алиасы для {names} берутся из прежнего хранилища плагина',
         groupAliasFill: 'Заполнить через LLM',
         groupAliasFillTitle: 'Для каждого участника без алиасов модель читает его описание и записывает сгенерированный список алиасов в его карточку (сразу сохраняет).',
         bulkProgressToast: 'Генерирую алиасы: {current} из {total}…',
@@ -369,18 +363,12 @@ function memberHasAliases(avatar) {
 
 /** Enabled members of the group whose CARD field has no aliases (legacy storage deliberately ignored, see
  * cardHasAliases), in enabledMembersOf order; members whose character no longer exists are skipped silently
- * (nothing can generate for them). Drives the alias-warning count and the bulk fill targets.
+ * (nothing can generate for them). Drives the alias-warning list and the bulk fill targets: the warning box names
+ * exactly this list, and a bulk fill migrates legacy-only members too — after the generated card aliases save, the
+ * card wins and the legacy storage is never read again for that member.
  * @param {object|null} group Active group object (may be null). @returns {string[]} Avatar filenames without card aliases. */
 function membersWithoutAliases(group) {
     return enabledMembersOf(group).filter(avatar => findCharacterIndex(avatar) !== -1 && !cardHasAliases(avatar));
-}
-
-/** Enabled members whose CARD field is empty but the legacy settings storage still carries aliases (the v1.0/v1.1
- * fallback keeps them matching in the cascade). Shown by the alias-warning legacy-transparency line and migrated by a
- * bulk fill click: after the generated card aliases save, the card wins and the legacy storage is never read again.
- * @param {object|null} group Active group object (may be null). @returns {string[]} Avatar filenames with legacy-only aliases. */
-function membersWithLegacyOnlyAliases(group) {
-    return enabledMembersOf(group).filter(avatar => findCharacterIndex(avatar) !== -1 && !cardHasAliases(avatar) && memberHasAliases(avatar));
 }
 
 /** Effective signal list for level1 (direct/alias matching): the alias table entry unioned with the character's full
@@ -1565,7 +1553,6 @@ function renderSettingsPanel() {
             '}',
             '/* group alias warning widget */',
             '#stgcmodes_group_aliaswarn { border: 1px solid var(--SmartThemeBorderColor); border-radius: 10px; background-color: var(--black30a); padding: 5px 8px; margin-top: 5px; display: none; }',
-            '#stgcmodes_group_aliaswarn_legacy { opacity: 0.65; font-size: 11px; margin-top: 3px; }',
             '.stgcmodes input::placeholder { color: var(--grey30); opacity: 1; }',
             '.stgcmodes .stgcmodes_hint { opacity: 0.65; font-size: 11px; margin-top: 3px; }',
             '.stgcmodes .stgcmodes_repo_row { margin: 4px 0 8px 0; font-size: 12px; }',
