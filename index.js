@@ -50,11 +50,13 @@ const UI_TEXT = {
     en: {
         panelTitle: 'Smart / Alias group modes', panelInstructions: 'Smart: director instructions',
         panelDepth: 'Context depth {n} (last messages)', panelL2: 'Level 2: indirect address (by attribute)',
-        panelL3: 'Level 3: who would join the conversation', panelNote: '"Nobody" note in chat',
+        panelL3: 'Level 3: who would join the conversation', panelL5: 'Level 5: context auto-pick (empty input)',
+        panelNote: '"Nobody" note in chat',
         panelCeiling: 'Responders cap (default)', ceilingNone: 'none',
         groupCeilingLabel: 'Responders cap (this group)', groupCeilingDefault: '(default)', groupCeilingNone: 'none',
         unknownNamesToast: 'st-gc-modes: unknown name in reply: {names}',
         quietFailedToast: 'st-gc-modes: quiet request failed, skipping levels 2/3',
+        contextFailedToast: 'st-gc-modes: level 5 request failed, skipped',
         noteNobody: '(Nobody joined the conversation.)',
         enabledLabel: 'Enabled', repoLink: 'Details in README',
         aliasPlaceholder: 'Kir, Kira-chan, baker',
@@ -79,6 +81,7 @@ const UI_TEXT = {
         ttDepth: 'How many of the last chat messages the director request sees (1-50).',
         ttL2: 'Ask the quiet request who is addressed indirectly, by a sign from their description (profession, role, look) instead of their name.',
         ttL3: 'Ask the quiet request who would have their own reason to join the conversation right now.',
+        ttL5: 'When the user sends an empty message and levels 2/3 find nobody, make one extra quiet request: who must speak next according to the dialogue logic? One clearly named participant responds instead of the "(nobody)" note. The persona is never picked.',
         ttNote: 'When Smart matches nobody, push a short user message into the chat so the silence is visible.',
         ttCeiling: 'Default limit on how many members one cascade may invoke (2-5; none = unlimited).',
         ttGroupCeiling: 'Per-group responders cap; it takes priority over the default value.',
@@ -89,11 +92,13 @@ const UI_TEXT = {
     ru: {
         panelTitle: 'Smart / Alias режимы группы', panelInstructions: 'Smart: инструкции режиссёра',
         panelDepth: 'Глубина контекста {n} (последние сообщения)', panelL2: 'Уровень 2: косвенный вызов (по признаку)',
-        panelL3: 'Уровень 3: кто мог бы поддержать разговор', panelNote: 'Заметка „никто не откликнулся“ в чате',
+        panelL3: 'Уровень 3: кто мог бы поддержать разговор', panelL5: 'Уровень 5: авто-выбор по контексту (пустой ввод)',
+        panelNote: 'Заметка „никто не откликнулся“ в чате',
         panelCeiling: 'Лимит отвечающих (по умолчанию)', ceilingNone: 'нет',
         groupCeilingLabel: 'Лимит отвечающих (группа)', groupCeilingDefault: '(по умолчанию)', groupCeilingNone: 'нет',
         unknownNamesToast: 'st-gc-modes: неизвестные имена в ответе: {names}',
         quietFailedToast: 'st-gc-modes: тихий запрос не удался, уровни 2/3 пропущены',
+        contextFailedToast: 'st-gc-modes: запрос уровня 5 не удался, пропущен',
         noteNobody: '(Никто не вступил в разговор.)',
         enabledLabel: 'Включено', repoLink: 'Подробности — в README',
         aliasPlaceholder: 'Кир, Кирочка, печница',
@@ -118,6 +123,7 @@ const UI_TEXT = {
         ttDepth: 'Сколько последних сообщений чата видит режиссёрский запрос (1-50).',
         ttL2: 'Спросить у тихого запроса, к кому обращаются косвенно — по признаку из описания (профессия, роль, внешность), а не по имени.',
         ttL3: 'Спросить у тихого запроса, у кого сейчас есть своя причина поддержать разговор.',
+        ttL5: 'Если сообщение пользователя пустое, а уровни 2/3 никого не нашли, сделать один тихий запрос: кто должен ответить по логике диалога? Один явно указанный участник отвечает вместо заметки «никто». Личность пользователя не выбирается никогда.',
         ttNote: 'Если в Smart не совпал никто, отправить в чат короткое сообщение пользователя, чтобы тишина была заметна.',
         ttCeiling: 'Сколько участников максимум может вызвать один каскад по умолчанию (2-5; «нет» = без лимита).',
         ttGroupCeiling: 'Лимит отвечающих для этой группы; приоритет выше общего значения.',
@@ -166,6 +172,7 @@ const DEFAULT_SETTINGS = {
     context_depth: 10,        // integer 1..50, how many last chat messages go into a quiet request
     level2Enabled: true,      // level2 (indirect address)
     level3Enabled: true,      // level3 (motivation to join)
+    level5Enabled: true,      // level5 context auto-pick on empty input (Smart only)
     nobodyNote: true,         // level4 "(nobody)" note in chat
     ceiling: 2,               // default responders cap: 2 | 3 | 4 | 5 | 0 (= none/unlimited)
     aliasSignals: {},         // DEPRECATED (v1.2.0): kept as a read-only fallback; new aliases live in character.data.extensions.st_gc_modes_aliases
@@ -264,7 +271,7 @@ let editorAliasesObserver = null; // the single MutationObserver switching the e
 let editorAliasAnchorLogged = false; // the single one-time "editor alias block anchor missing" debug line
 let editorAliasGenerateBusy = false; // an editor alias generation request is currently in flight
 let bulkAliasFillBusy = false; // a bulk "Fill with LLM" run over the group alias widget is currently in flight
-const cascadeStats = { messagesSeen: 0, cascadesRun: 0, level1Hits: 0, quietCalls: 0, generationsPushed: 0, notes: 0, personaEmptyRemoved: 0 };
+const cascadeStats = { messagesSeen: 0, cascadesRun: 0, level1Hits: 0, quietCalls: 0, level5Calls: 0, level5Hits: 0, generationsPushed: 0, notes: 0, personaEmptyRemoved: 0 };
 
 // ---- group helpers ----
 
@@ -477,23 +484,13 @@ function buildQuietQuestion() {
     return 'Which of the participants has their own motivation or duty to chime in after the LAST message? Answer only with participant names copied exactly from the list, separated by commas, or reply none if nobody fits.';
 }
 
-/** Builds the single-string director prompt: instructions, optional single-criterion line, participant list
- * (name, aka signals, collapsed description; persona-named members and persona-named aka signals are hidden so
- * the persona is never a pickable candidate), recent chat transcript (persona messages unchanged) and the question.
- * @param {string} inputText Raw user message text. @param {string[]} memberList Enabled member avatar filenames.
- * @returns {string} Prompt text. */
-function buildQuietPrompt(inputText, memberList) {
-    const blocks = [];
-    blocks.push(String(settings.smart_instructions ?? ''));
-
-    const l2 = !!settings.level2Enabled;
-    const l3 = !!settings.level3Enabled;
-    if (l2 && !l3) {
-        blocks.push('Apply ONLY criterion 2 (indirect address) and ignore criterion 3.');
-    } else if (!l2 && l3) {
-        blocks.push('Apply ONLY criterion 3 (their own motivation to chime in) and ignore criterion 2.');
-    }
-
+/** Builds the participant list lines shared by the quiet (level2/3) and level5 director prompts: one
+ * `- Name: ... (aka: ...) — description: ...` line per existing member in group member order, keeping the exact
+ * formatting of the former inline loop; persona-named members and persona-named aka signals are hidden so the
+ * persona is never a pickable candidate.
+ * @param {string[]} memberList Enabled member avatar filenames.
+ * @returns {string[]} Formatted participant lines. */
+function buildParticipantLines(memberList) {
     const participantLines = [];
     for (const avatar of memberList) {
         const index = findCharacterIndex(avatar);
@@ -513,8 +510,14 @@ function buildQuietPrompt(inputText, memberList) {
         line += ` — description: ${description}`;
         participantLines.push(line);
     }
-    blocks.push(['Participants:', ...participantLines].join('\n'));
+    return participantLines;
+}
 
+/** Builds the recent-chat transcript lines shared by the quiet (level2/3) and level5 director prompts: the last
+ * clampDepth() non-system messages, oldest first, as `Name: message` lines; user messages keep their own name
+ * (name1 fallback), character messages resolve by character_id/force_chid with a '?' fallback.
+ * @returns {string[]} Transcript lines, oldest first. */
+function buildTranscriptLines() {
     const depth = clampDepth();
     const transcript = [];
     const recent = chat.filter(item => item && item.is_system !== true).slice(-depth);
@@ -528,7 +531,31 @@ function buildQuietPrompt(inputText, memberList) {
         }
         transcript.push(`${senderName}: ${String(item.mes ?? '')}`);
     }
-    blocks.push([`Recent chat (oldest first, last ${depth} messages):`, ...transcript].join('\n'));
+    return transcript;
+}
+
+/** Builds the single-string director prompt: instructions, optional single-criterion line, participant list
+ * (via buildParticipantLines; persona-named members and persona-named aka signals are hidden so the persona is
+ * never a pickable candidate), recent chat transcript (persona messages unchanged, via buildTranscriptLines)
+ * and the question.
+ * @param {string} inputText Raw user message text. @param {string[]} memberList Enabled member avatar filenames.
+ * @returns {string} Prompt text. */
+function buildQuietPrompt(inputText, memberList) {
+    const blocks = [];
+    blocks.push(String(settings.smart_instructions ?? ''));
+
+    const l2 = !!settings.level2Enabled;
+    const l3 = !!settings.level3Enabled;
+    if (l2 && !l3) {
+        blocks.push('Apply ONLY criterion 2 (indirect address) and ignore criterion 3.');
+    } else if (!l2 && l3) {
+        blocks.push('Apply ONLY criterion 3 (their own motivation to chime in) and ignore criterion 2.');
+    }
+
+    blocks.push(['Participants:', ...buildParticipantLines(memberList)].join('\n'));
+
+    const depth = clampDepth();
+    blocks.push([`Recent chat (oldest first, last ${depth} messages):`, ...buildTranscriptLines()].join('\n'));
 
     blocks.push(`Question: ${buildQuietQuestion()}`);
     return blocks.join('\n\n');
@@ -563,6 +590,74 @@ async function quietLevelRequest(inputText, memberList) {
     }
     if (lastCascade) lastCascade.quietRaw = trimmed.slice(0, QUIET_RAW_LIMIT);
     return trimmed;
+}
+
+// ---- level 5: context auto-pick on empty input ----
+
+// Instruction block for the level5 director request (module scope, English only — the answer is parsed, not shown).
+const CONTEXT_PICK_INSTRUCTIONS = [
+    'You are the group-chat director deciding who must speak next in an ongoing group chat.',
+    'There is NO new user message: the empty send is just a signal to continue the dialogue.',
+    'Judge by the logic of the dialogue: unfinished expectations, unanswered question-answer pairs, who asked whom and is waiting, whose turn is due next.',
+    'Do not invent new topics. Do not repeat finished exchanges.',
+    'Choose from the participants only. The user is not a participant and must never be picked.',
+    'Answer format: exactly ONE participant name copied exactly from the list (name or an aka form). If the dialogue has no clear next speaker (dead end, everybody answered), answer exactly: none.',
+].join('\n');
+
+/** Builds the level5 context prompt: the instruction block, the shared participant list under a choose-from-this-
+ * list-only header, the shared recent-chat transcript (same depth clamp and header style as buildQuietPrompt) and
+ * the closing one-name question. Reuses buildParticipantLines and buildTranscriptLines so both director prompts
+ * see the exact same participant and chat views.
+ * @param {string[]} memberList Enabled member avatar filenames.
+ * @returns {string} Prompt text. */
+function buildContextPrompt(memberList) {
+    const blocks = [];
+    blocks.push(CONTEXT_PICK_INSTRUCTIONS);
+    blocks.push(['Participants (choose from this list only):', ...buildParticipantLines(memberList)].join('\n'));
+    const depth = clampDepth();
+    blocks.push([`Recent chat (oldest first, last ${depth} messages):`, ...buildTranscriptLines()].join('\n'));
+    blocks.push('Question: According to the dialogue logic, who must speak next? Answer with exactly ONE participant name copied exactly from the list above, or reply none if there is no clear next speaker.');
+    return blocks.join('\n\n');
+}
+
+/** Runs ONE quiet (raw) LLM request implementing level5 (context auto-pick on empty input, Smart only): asks the
+ * director who must speak next according to the dialogue logic and resolves the answer STRICTLY (exact name/aka
+ * index lookups only, no fuzzy fallback). Mirrors quietLevelRequest mechanics: failures and empty answers never
+ * throw; any other than a single resolved member returns null so the caller stays with the regular "nobody" path
+ * (level4 note/silence).
+ * @param {string[]} memberList Enabled member avatar filenames.
+ * @returns {Promise<string|null>} The single resolved member avatar filename, or null. */
+async function contextLevelRequest(memberList) {
+    if (lastCascade) lastCascade.level5Calls += 1;
+    cascadeStats.level5Calls += 1;
+    console.log(LOG_PREFIX, `level5 context request: start (${memberList.length} participants)`);
+
+    let answer = '';
+    try {
+        answer = await generateRaw({ prompt: buildContextPrompt(memberList), systemPrompt: '' });
+    } catch (err) {
+        console.error(LOG_PREFIX, 'level5 context request failed', err);
+        if (typeof toastr !== 'undefined' && typeof toastr.error === 'function') toastr.error(localize('contextFailedToast'), 'st-gc-modes');
+        return null;
+    }
+
+    const trimmed = String(answer ?? '').trim();
+    if (trimmed.length === 0) {
+        console.log(LOG_PREFIX, 'level5 context request returned empty content (reasoning model?)');
+        return null;
+    }
+    if (lastCascade) lastCascade.level5Raw = trimmed.slice(0, QUIET_RAW_LIMIT);
+
+    const parsed = parseQuietAnswerStrict(trimmed, memberList);
+    if (parsed.unknown.length > 0) {
+        console.log(LOG_PREFIX, `level5: unresolved tokens ignored: ${parsed.unknown.join(', ')}`);
+    }
+    if (parsed.chosen.length === 1) {
+        console.log(LOG_PREFIX, `level5: single clear pick: ${avatarToName(parsed.chosen[0])}`);
+        return parsed.chosen[0];
+    }
+    console.log(LOG_PREFIX, `level5: no single clear pick (${parsed.chosen.map(avatarToName).join(', ') || 'none'}) — staying with the nobody path`);
+    return null;
 }
 
 // ---- character-card aliases (editor + bulk fill) ----
@@ -939,19 +1034,17 @@ async function saveCharacterAliases(chid, aliasString) {
 
 // ---- parsing the model answer ----
 
-/** Parses the director reply into a chosen avatar list (in model order, deduped) and a list of unrecognized raw
- * tokens; "nobody" answers (NONE_TOKENS) collapse to an empty list, and persona-named tokens are dropped silently
- * (they must never become "unknown name" toast noise). Persona-named members and persona-named aka signals never
- * resolve to a member.
- * @param {string} answer Raw model answer. @param {string[]} memberList Enabled member avatar filenames.
- * @returns {{chosen: string[], unknown: string[]}} Chosen avatars and unresolved tokens. */
-function parseQuietAnswer(answer, memberList) {
-    const chosen = [];
-    const unknown = [];
+/** Pre-filters a raw model answer into cleaned candidate tokens, shared by parseQuietAnswer and
+ * parseQuietAnswerStrict: split on [,;\n\r], trim, drop empties, silently drop NONE_TOKENs ("none", "никто",
+ * "no one", ...) and persona-named tokens (they must never become "unknown name" toast noise; surrounding
+ * punctuation is stripped first, so "None." or "None:" collapse to nobody too); a single remaining token that
+ * merely STARTS with a NONE_TOKEN word collapses to nobody.
+ * @param {string} answer Raw model answer. @returns {string[]} Cleaned candidate tokens (may be empty). */
+function answerTokens(answer) {
     const rawParts = String(answer ?? '').split(/[,;\n\r]+/u).map(part => part.trim()).filter(part => part.length > 0);
 
     // Drop tokens that are themselves a NONE_TOKEN ("none", "никто", "no one", ...) and tokens equal to the user's
-    // persona name: dropped silently exactly like the NONE_TOKENs, so a persona-like label never surfaces as
+    // persona name: dropped silently exactly like the NONE_TOKENS, so a persona-like label never surfaces as
     // "unknown name" toast noise. Surrounding punctuation and other non-letters are stripped first, so
     // "None." or "None:" collapse to nobody too.
     const stripEdges = (part) => part.replace(/^[^\p{L}\p{N}'-]+|[^\p{L}\p{N}'-]+$/gu, '');
@@ -962,10 +1055,15 @@ function parseQuietAnswer(answer, memberList) {
         const startsWithNoneWord = Array.from(NONE_TOKENS).some(token => lower === token || (lower.startsWith(token) && (lower.charAt(token.length) === ' ' || lower.length === token.length)));
         if (startsWithNoneWord) tokens = [];
     }
-    if (tokens.length === 0) return { chosen, unknown };
+    return tokens;
+}
 
-    // Exact-match index: lowercased name and lowercased table signals -> avatar. Persona-named members are skipped
-    // entirely and persona-named aka signals are not registered, so a persona-like label never resolves to a member.
+/** Builds the exact-match resolution index shared by the quiet parsers: lowercased member name and lowercased
+ * table signals -> avatar, plus the flat label list for the fuzzy fallback. Persona-named members are skipped
+ * entirely and persona-named aka signals are not registered, so a persona-like label never resolves to a member.
+ * @param {string[]} memberList Enabled member avatar filenames.
+ * @returns {{exactIndex: Map<string, string>, labels: Array<{label: string, avatar: string, name: string}>}} Exact index and fuzzy labels. */
+function buildExactSignalIndex(memberList) {
     const exactIndex = new Map();
     const labels = [];
     for (const avatar of memberList) {
@@ -986,6 +1084,22 @@ function parseQuietAnswer(answer, memberList) {
             }
         }
     }
+    return { exactIndex, labels };
+}
+
+/** Parses the director reply into a chosen avatar list (in model order, deduped) and a list of unrecognized raw
+ * tokens; "nobody" answers (NONE_TOKENS) collapse to an empty list, and persona-named tokens are dropped silently
+ * (they must never become "unknown name" toast noise). Persona-named members and persona-named aka signals never
+ * resolve to a member. Exact matches win; only reasonably long tokens fall back to one fuzzy Fuse search.
+ * @param {string} answer Raw model answer. @param {string[]} memberList Enabled member avatar filenames.
+ * @returns {{chosen: string[], unknown: string[]}} Chosen avatars and unresolved tokens. */
+function parseQuietAnswer(answer, memberList) {
+    const chosen = [];
+    const unknown = [];
+    const tokens = answerTokens(answer);
+    if (tokens.length === 0) return { chosen, unknown };
+
+    const { exactIndex, labels } = buildExactSignalIndex(memberList);
 
     // One Fuse over the flat labels of all enabled members for fuzzy fallback.
     const fuse = new Fuse(labels, { keys: ['label'], ignoreLocation: true, threshold: 0.45, includeScore: true });
@@ -998,6 +1112,34 @@ function parseQuietAnswer(answer, memberList) {
             const hits = fuse.search(token);
             if (Array.isArray(hits) && hits.length > 0 && hits[0]?.item?.avatar) avatar = hits[0].item.avatar;
         }
+        if (avatar) {
+            if (!taken.has(avatar)) {
+                taken.add(avatar);
+                chosen.push(avatar);
+            }
+        } else {
+            unknown.push(token);
+        }
+    }
+    return { chosen, unknown };
+}
+
+/** STRICT variant of parseQuietAnswer for level5 (context auto-pick): resolves candidate tokens ONLY through the
+ * exact-match index (lowercased name or aka signal, cyrillic-neutral) — never fuzzy, so only a clearly named
+ * participant can win; everything else lands in unknown. NONE_TOKEN and persona stripping are shared via
+ * answerTokens.
+ * @param {string} answer Raw model answer. @param {string[]} memberList Enabled member avatar filenames.
+ * @returns {{chosen: string[], unknown: string[]}} Chosen avatars and unresolved tokens. */
+function parseQuietAnswerStrict(answer, memberList) {
+    const chosen = [];
+    const unknown = [];
+    const tokens = answerTokens(answer);
+    if (tokens.length === 0) return { chosen, unknown };
+
+    const { exactIndex } = buildExactSignalIndex(memberList);
+    const taken = new Set();
+    for (const token of tokens) {
+        const avatar = exactIndex.get(token.toLowerCase());
         if (avatar) {
             if (!taken.has(avatar)) {
                 taken.add(avatar);
@@ -1210,6 +1352,7 @@ async function runCascadeFor(item) {
         startedAt: Date.now(), finishedAt: null, mode: mode, input: inputText,
         kind: isEmptyCascade ? 'empty-continue' : 'message',
         level1HitNames: [], quietCalls: 0, quietRaw: '', parsedNames: [], unknownNames: [],
+        level5Calls: 0, level5Raw: '', level5ChosenNames: [],
         chosenNames: [], trimmedByCeiling: [], notePushed: false, invocations: [], error: null,
     };
     cascadeStats.cascadesRun += 1;
@@ -1267,6 +1410,21 @@ async function runCascadeFor(item) {
         const chosen = applyCeiling(parsed.chosen, group);
         lastCascade.chosenNames = chosen.map(avatarToName);
         if (chosen.length === 0) {
+            // Level5 attempt first: ONLY for empty-input cascades (Smart), and only at this exact point — after
+            // the regular quiet request resolved nobody (also when levels 2/3 are both disabled, which reaches
+            // the same point); any non-single outcome keeps the current nobody behavior below.
+            const level5Avatar = (isEmptyCascade && settings.level5Enabled && members.length > 0)
+                ? await contextLevelRequest(members)
+                : null;
+            if (level5Avatar) {
+                cascadeStats.level5Hits += 1;
+                const level5Chosen = applyCeiling([level5Avatar], group);
+                lastCascade.level5ChosenNames = level5Chosen.map(avatarToName);
+                lastCascade.chosenNames = level5Chosen.map(avatarToName);
+                console.log(LOG_PREFIX, `level5 context pick: ${lastCascade.chosenNames.join(', ')}`);
+                await invokeMembers(level5Chosen, item);
+                return;
+            }
             // Nobody path: Smart mode only, honor the level4 setting.
             if (settings.nobodyNote) {
                 await pushNobodyNote();
@@ -1616,7 +1774,7 @@ async function onBulkAliasFill() {
 // ---- settings panel ----
 
 /** Renders the st-gc-modes settings drawer into the extensions settings container: master switch row, repo link,
- * director instructions, context depth, the level2/level3/level4 checkboxes and the default responders cap.
+ * director instructions, context depth, the level2/level3/level5/level4 checkboxes and the default responders cap.
  * Appends the static theme-safe CSS block to the head exactly once. The static HTML skeleton contains no dynamic
  * values: every label is filled through .text() from UI_TEXT, every tooltip goes through .attr('title', ...) and
  * every dynamic value goes through .val()/.prop(). */
@@ -1668,6 +1826,7 @@ function renderSettingsPanel() {
         '</div>',
         '<label class="flex1 checkbox_label" for="stgcmodes_l2"><input id="stgcmodes_l2" type="checkbox" /><span class="stgcmodes_i18n" data-key="panelL2"></span></label>',
         '<label class="flex1 checkbox_label" for="stgcmodes_l3"><input id="stgcmodes_l3" type="checkbox" /><span class="stgcmodes_i18n" data-key="panelL3"></span></label>',
+        '<label class="flex1 checkbox_label" for="stgcmodes_l5"><input id="stgcmodes_l5" type="checkbox" /><span class="stgcmodes_i18n" data-key="panelL5"></span></label>',
         '<label class="flex1 checkbox_label" for="stgcmodes_note"><input id="stgcmodes_note" type="checkbox" /><span class="stgcmodes_i18n" data-key="panelNote"></span></label>',
         '<div class="flex1">',
         '<label for="stgcmodes_ceiling" class="stgcmodes_label"><span class="stgcmodes_i18n" data-key="panelCeiling"></span></label>',
@@ -1693,6 +1852,7 @@ function renderSettingsPanel() {
     $('#stgcmodes_depth').attr('title', localize('ttDepth'));
     $('#stgcmodes_content').find('label[for="stgcmodes_l2"]').attr('title', localize('ttL2'));
     $('#stgcmodes_content').find('label[for="stgcmodes_l3"]').attr('title', localize('ttL3'));
+    $('#stgcmodes_content').find('label[for="stgcmodes_l5"]').attr('title', localize('ttL5'));
     $('#stgcmodes_content').find('label[for="stgcmodes_note"]').attr('title', localize('ttNote'));
     $('#stgcmodes_content').find('label[for="stgcmodes_ceiling"]').attr('title', localize('ttCeiling'));
     $('#stgcmodes_ceiling').attr('title', localize('ttCeiling'));
@@ -1733,8 +1893,8 @@ function renderSettingsPanel() {
         console.log(LOG_PREFIX, `context depth set to ${value}`);
     });
 
-    // Level checkboxes (level2 / level3 / level4).
-    for (const [id, key] of [['#stgcmodes_l2', 'level2Enabled'], ['#stgcmodes_l3', 'level3Enabled'], ['#stgcmodes_note', 'nobodyNote']]) {
+    // Level checkboxes (level2 / level3 / level5 / level4).
+    for (const [id, key] of [['#stgcmodes_l2', 'level2Enabled'], ['#stgcmodes_l3', 'level3Enabled'], ['#stgcmodes_l5', 'level5Enabled'], ['#stgcmodes_note', 'nobodyNote']]) {
         $(id).prop('checked', !!settings[key]).on('change', function () {
             settings[key] = !!$(this).prop('checked');
             saveSettingsDebounced();
