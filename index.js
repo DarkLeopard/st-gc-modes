@@ -344,19 +344,37 @@ function memberSignals(avatar, _name) {
     return null;
 }
 
-/** Whether a member already has usable alias signals: memberSignals folds the card-first source and the legacy
- * fallback into a single call, so a non-empty result is enough.
+/** Whether the member's CHARACTER CARD already carries aliases — strictly per card (data.extensions.st_gc_modes_aliases
+ * split through parseSignalList); the legacy settings storage is ignored. Used for the alias-warning "without aliases"
+ * count and the bulk fill targets, so a legacy-only member stays in the pool and gets migrated by a bulk click.
+ * @param {string} avatar Avatar filename. @returns {boolean} True when the card yields at least one signal. */
+function cardHasAliases(avatar) {
+    return parseSignalList(readCardAliases(characters[findCharacterIndex(avatar)])).length > 0;
+}
+
+/** Whether a member resolves usable alias signals from either source (card or legacy): memberSignals folds the
+ * card-first source and the legacy fallback into one call, so a non-empty result is enough. The CASCADE keeps
+ * using this call — a legacy-only member keeps matching in live chats.
  * @param {string} avatar Avatar filename. @returns {boolean} True when the member resolves at least one signal. */
 function memberHasAliases(avatar) {
     const signals = memberSignals(avatar, '');
     return Array.isArray(signals) && signals.length > 0;
 }
 
-/** Enabled members of the group that have no aliases at all, in enabledMembersOf order; members whose character no
- * longer exists are skipped silently (nothing can generate for them).
- * @param {object|null} group Active group object (may be null). @returns {string[]} Avatar filenames without aliases. */
+/** Enabled members of the group whose CARD field has no aliases (legacy storage deliberately ignored, see
+ * cardHasAliases), in enabledMembersOf order; members whose character no longer exists are skipped silently
+ * (nothing can generate for them). Drives the alias-warning count and the bulk fill targets.
+ * @param {object|null} group Active group object (may be null). @returns {string[]} Avatar filenames without card aliases. */
 function membersWithoutAliases(group) {
-    return enabledMembersOf(group).filter(avatar => findCharacterIndex(avatar) !== -1 && !memberHasAliases(avatar));
+    return enabledMembersOf(group).filter(avatar => findCharacterIndex(avatar) !== -1 && !cardHasAliases(avatar));
+}
+
+/** Enabled members whose CARD field is empty but the legacy settings storage still carries aliases (the v1.0/v1.1
+ * fallback keeps them matching in the cascade). Shown by the alias-warning legacy-transparency line and migrated by a
+ * bulk fill click: after the generated card aliases save, the card wins and the legacy storage is never read again.
+ * @param {object|null} group Active group object (may be null). @returns {string[]} Avatar filenames with legacy-only aliases. */
+function membersWithLegacyOnlyAliases(group) {
+    return enabledMembersOf(group).filter(avatar => findCharacterIndex(avatar) !== -1 && !cardHasAliases(avatar) && memberHasAliases(avatar));
 }
 
 /** Effective signal list for level1 (direct/alias matching): the alias table entry unioned with the character's full
