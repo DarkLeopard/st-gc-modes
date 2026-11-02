@@ -92,7 +92,7 @@ Do not pick anyone out of politeness. If several fit, list all. Answer format: p
 
 **Installation.** In SillyTavern open **Extensions → Install extension** (the puzzle icon / "Install extension" button), paste the repo URL `https://github.com/DarkLeopard/st-gc-modes`, choose **for me only**, and reload the page (F5).
 
-**Update.** In the same Extensions view, the extension shows an **Update** button when the repo has a newer version. Auto-update is off for version 1.1.0 — click **Update** manually. If no button appears, remove the extension and install it again by the same UI path: the settings (enabled state, aliases, instructions) survive a reinstall because they are stored in user settings, not in the extension folder.
+**Update.** Open **Extensions → Manage extensions**: the extension row shows an update button (download icon, hover hint "Update available") when the repo has a newer version. The update applies immediately, no confirmation prompt. Auto-update is off for version 1.1.0 — click the button manually. If no button appears, remove the extension and install it again by the same UI path: the settings (enabled state, aliases, instructions) survive a reinstall because they are stored in user settings, not in the extension folder.
 
 **Reinstall / clean install.** Remove the old folder through the Extensions UI (**Uninstall** / **Remove**), then install by URL again.
 
