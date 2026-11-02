@@ -5,7 +5,7 @@
 // ES2022, plain ES module, no build step, no npm dependencies.
 // Core SillyTavern is never patched: the extension only injects DOM and listens to events.
 
-import { eventSource, event_types, Generate, generateRaw, addOneMessage, deleteMessage, chat, characters, name1, saveChatConditional, is_send_press, saveSettingsDebounced, this_chid, getRequestHeaders, getOneCharacter } from '../../../../script.js';
+import { eventSource, event_types, Generate, generateRaw, addOneMessage, deleteMessage, chat, characters, name1, saveCharacterDebounced, saveChatConditional, is_send_press, saveSettingsDebounced, this_chid, getRequestHeaders, getOneCharacter } from '../../../../script.js';
 import { getMessageTimeStamp } from '../../../RossAscends-mods.js';
 import { extension_settings, getContext } from '../../../extensions.js';
 import { groups, selected_group, editGroup, is_group_generating } from '../../../group-chats.js';
@@ -268,6 +268,7 @@ let lastCascade = null;       // debug stats object of the most recent cascade r
 let injectLogged = false;     // the single one-time "options injected" debug line
 let removeLogged = false;     // the single one-time "options removed (disabled)" debug line
 let editorAliasesObserver = null; // the single MutationObserver switching the editor alias field between edit/create modes
+let editorSubmitSyncBound = false; // the document-capture submit preprocessor was bound once (see bindEditorSubmitSync)
 let editorAliasAnchorLogged = false; // the single one-time "editor alias block anchor missing" debug line
 let editorAliasGenerateBusy = false; // an editor alias generation request is currently in flight
 let bulkAliasFillBusy = false; // a bulk "Fill with LLM" run over the group alias widget is currently in flight
@@ -769,7 +770,7 @@ function ensureEditorAliasesField() {
                 console.log(LOG_PREFIX, 'editor alias block: creator notes anchor missing, appended to the form');
             }
         }
-        input.on('input', syncEditorAliasesHiddenOnly).on('change', syncEditorAliasesFromInput);
+        input.on('input', syncEditorAliasesHiddenOnly).on('change', onEditorAliasChange);
         genButton.on('click', onEditorAliasGenerate);
         syncEditorAliasesMode();
         console.log(LOG_PREFIX, 'editor alias field injected into the character form');
@@ -791,6 +792,22 @@ function syncEditorAliasesHiddenOnly() {
     }
 }
 
+/** change-event handler of the editor alias field: normalize+mirror via syncEditorAliasesFromInput and, in edit mode,
+ * schedule the core debounced character save. Core parity: every native editor field autosaves in edit mode on its
+ * own events (elementsToUpdate -> saveCharacterDebounced) — without the same wiring our field would silently lose
+ * edits (including a cleared list) when the editor is closed without pressing Save. The submit-time capture
+ * preprocessor reuses only syncEditorAliasesFromInput, NOT this autosave — otherwise every submit would schedule
+ * another save in a loop. Never throws.
+ * @returns {void} Nothing. */
+function onEditorAliasChange() {
+    try {
+        syncEditorAliasesFromInput();
+        if ($('#form_create').attr('actiontype') === 'editcharacter') saveCharacterDebounced();
+    } catch (err) {
+        console.error(LOG_PREFIX, 'editor alias change handling failed:', err);
+    }
+}
+
 /** Normalizes the editor alias text field (parseSignalList joined with ', '), writes the normalized value back into
  * the field only when it differs (no caret jumps while typing) and mirrors the result into the hidden extensions
  * carrier so the next form save submits a fresh st_gc_modes_aliases value. */
@@ -807,9 +824,41 @@ function syncEditorAliasesFromInput() {
     }
 }
 
+/** Capture-phase submit preprocessor on document: fires BEFORE the core's own #form_create submit handler (which reads
+ * FormData at its first line), so the hidden extensions carrier always carries the CURRENT visible alias value at save
+ * time — even when the blur/change sequence did not run (focus left the page without a change event, or the field
+ * value was written programmatically). It reuses syncEditorAliasesFromInput (normalize + carrier mirror only — the
+ * edit-mode autosave lives on the change path in onEditorAliasChange and must NOT run here, or every submit would
+ * schedule another save in a loop); in create mode it does nothing. Never throws and never touches the event
+ * (no preventDefault/stopPropagation) — the core save continues exactly as before. Bound once by bindEditorSubmitSync. */
+function normalizeAliasesOnSubmit(event) {
+    try {
+        const form = /** @type {HTMLFormElement} */ (event.target);
+        if (!form || form.id !== 'form_create') return; // unrelated form (API key dialog etc.) — ignore silently
+        if (String(form.getAttribute('actiontype') ?? '') !== 'editcharacter') return; // create mode: core create_save owns it
+        syncEditorAliasesFromInput();
+    } catch (err) {
+        console.error(LOG_PREFIX, 'editor alias submit sync failed:', err);
+    }
+}
+
+/** Binds the capture-phase submit preprocessor exactly once (idempotent); never throws. */
+function bindEditorSubmitSync() {
+    try {
+        if (editorSubmitSyncBound) return;
+        editorSubmitSyncBound = true;
+        document.addEventListener('submit', normalizeAliasesOnSubmit, true);
+        console.log(LOG_PREFIX, 'editor alias submit-time sync bound (capture phase)');
+    } catch (err) {
+        console.error(LOG_PREFIX, 'editor alias submit sync binding failed:', err);
+        editorSubmitSyncBound = false;
+    }
+}
+
 /** Writes the value the next form save will submit as the extensions body field: a JSON object with the
  * st_gc_modes_aliases key only (the server deep-merges it into char.data.extensions). The key is written even when
- * the string is empty, so clearing the field erases a previously stored list.
+ * the string is empty, so clearing the field erases a previously stored list. The change path this participates in
+ * schedules the core debounced character save in edit mode.
  * @param {string} aliasString Comma-separated alias string (may be empty). */
 function setHiddenExtensions(aliasString) {
     $('#stgcmodes_char_extensions').val(JSON.stringify({ st_gc_modes_aliases: String(aliasString ?? '') }));
@@ -1987,6 +2036,7 @@ function initModule() {
         } catch (err) {
             console.error(LOG_PREFIX, 'editor alias field setup failed:', err);
         }
+        bindEditorSubmitSync();
         defineDebugHook();
         console.log(LOG_PREFIX, 'extension loaded');
     } catch (err) {
