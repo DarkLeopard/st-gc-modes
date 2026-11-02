@@ -1040,8 +1040,9 @@ function renderSettingsPanel() {
 
     target.append(skeleton);
 
-    // Fill every localized label through .text() — never interpolated into HTML strings.
-    $('#stgcmodes_content').find('.stgcmodes_i18n').each(function () {
+    // Fill every localized label through .text() — scan the WHOLE drawer root (the header title lives outside
+    // #stgcmodes_content) — never interpolated into HTML strings.
+    $('.stgcmodes').find('.stgcmodes_i18n').each(function () {
         $(this).text(localize(String($(this).attr('data-key'))));
     });
 
