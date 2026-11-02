@@ -675,7 +675,11 @@ function setHiddenExtensions(aliasString) {
  * FormData submits it), the field is populated from the currently loaded card and the generate button enabled state
  * follows the master switch. Create mode: the name attribute is REMOVED (core appends its own extensions field in
  * create mode and a duplicate would break the server parse), the field is cleared and the button stays disabled
- * with an explanatory title. */
+ * with an explanatory title.
+ * This is the FULL sync, so its call sites are deliberately limited to the moments the mode itself flips or the card
+ * behind the form was swapped: the MutationObserver callback, onCharacterEditorOpened and the initial sync at the end
+ * of ensureEditorAliasesField. Everywhere else use the half-syncs: syncEditorAliasesButtonState (button + carrier
+ * name attribute only) and refreshEditorAliasesFromCard (field + carrier populated from the card only). */
 function syncEditorAliasesMode() {
     const field = $('#stgcmodes_char_aliases');
     const genButton = $('#stgcmodes_char_alias_gen');
@@ -694,6 +698,55 @@ function syncEditorAliasesMode() {
         setHiddenExtensions(''); // defensive: the name attribute is removed here, but a stale carrier value must not linger
         genButton.prop('disabled', true);
         genButton.attr('title', localize('charAliasGenUnavailable'));
+    }
+}
+
+/** Population half of the mode sync: re-reads ONLY the aliases stored in the card behind the open editor form into
+ * the visible field (written only when the value differs, so no caret jumps) and re-initializes the hidden carrier
+ * from them via setHiddenExtensions (an untouched save re-submits the stored list instead of an empty string).
+ * Used ONLY for genuine card changes — e.g. a member freshly saved from the bulk fill that is open in the editor at
+ * that very moment; it no-ops outside edit mode ("nothing to populate") and, when an expected chid is passed,
+ * whenever the editor is open on a different member. Never touches the generate button; for mere button/state
+ * updates use syncEditorAliasesButtonState instead.
+ * @param {number} [expectedChid] Index into characters the editor must currently work on for the refresh to apply. */
+function refreshEditorAliasesFromCard(expectedChid) {
+    try {
+        const field = $('#stgcmodes_char_aliases');
+        if ($('#form_create').attr('actiontype') !== 'editcharacter') return; // nothing to populate in create mode
+        const chid = getEditorChid();
+        if (expectedChid !== undefined && expectedChid !== chid) return; // editor is open on a different member
+        const card = Number.isInteger(chid) ? characters[chid] : null;
+        const aliases = readCardAliases(card);
+        if (field.length > 0 && String(field.val() ?? '') !== aliases) field.val(aliases);
+        setHiddenExtensions(aliases);
+    } catch (err) {
+        console.error(LOG_PREFIX, 'editor alias card refresh failed:', err);
+    }
+}
+
+/** Button-state half of the mode sync: re-states ONLY the generate button disabled/title (plus, in edit mode, the
+ * carrier's name="extensions" submit-ability) — never touches the visible field and never rewrites the carrier
+ * VALUE, so it is safe to run at any moment (generate finally, master-switch change, context hooks) without wiping
+ * fresh/unsaved input. Edit mode: name="extensions" is kept on the hidden carrier (idempotent) and the button
+ * follows the master switch. Create mode: the name attribute removal stays a mode-change concern — it is cleared
+ * only when actually present (checked via the attribute so it can persist being absent; the removeAttr call itself
+ * is harmless but must not re-clear the field) and the button stays disabled with an explanatory title. */
+function syncEditorAliasesButtonState() {
+    try {
+        const genButton = $('#stgcmodes_char_alias_gen');
+        if ($('#form_create').attr('actiontype') === 'editcharacter') {
+            $('#stgcmodes_char_extensions').attr('name', 'extensions'); // idempotent: FormData must submit the carrier
+            genButton.prop('disabled', !isEnabled());
+            genButton.attr('title', localize('charAliasGenTitle'));
+        } else {
+            if ($('#stgcmodes_char_extensions').attr('name') !== undefined) {
+                $('#stgcmodes_char_extensions').removeAttr('name'); // mode-change concern: clear only when present, the attribute must persist being absent
+            }
+            genButton.prop('disabled', true);
+            genButton.attr('title', localize('charAliasGenUnavailable'));
+        }
+    } catch (err) {
+        console.error(LOG_PREFIX, 'editor alias button sync failed:', err);
     }
 }
 
@@ -746,7 +799,7 @@ async function onEditorAliasGenerate() {
         console.log(LOG_PREFIX, `editor aliases generated: ${aliases.length} items`);
     } finally {
         editorAliasGenerateBusy = false;
-        syncEditorAliasesMode(); // restore in finally, per handler contract: re-states the button disabled/title per the current mode and master switch
+        syncEditorAliasesButtonState(); // restore in finally: re-states the button disabled/title per the current mode and master switch WITHOUT re-reading the card — that would wipe the answer just written into the field
     }
 }
 
@@ -1429,7 +1482,7 @@ async function onBulkAliasFill() {
             }
             ok += 1;
             console.log(LOG_PREFIX, 'bulk aliases written:', ch.name, '->', aliases.length, 'items');
-            if (getEditorChid() === chid) syncEditorAliasesMode(); // the character is open in the editor: re-read the freshly saved card into the form
+            refreshEditorAliasesFromCard(chid); // the character is open in the editor: re-read the freshly saved card into the form
         }
         if (typeof toastr !== 'undefined' && typeof toastr.info === 'function') {
             toastr.info(localize('bulkDoneToast').replace('{ok}', () => String(ok)).replace('{total}', () => String(targets.length)), MODULE_NAME);
@@ -1537,7 +1590,7 @@ function renderSettingsPanel() {
             if (typeof toastr !== 'undefined') toastr.info(localize('toggleOffToast'), 'st-gc-modes');
         }
         // The editor alias field stays injected; its gen button follows the switch (off → disabled, on → per mode).
-        syncEditorAliasesMode();
+        syncEditorAliasesButtonState();
         console.log(LOG_PREFIX, `enabled toggled: ${settings.enabled}`);
     });
 
@@ -1616,7 +1669,7 @@ function onContextEvents() {
         // The editor alias field stays injected and functional even when the master switch is off
         // (decision: injecting is harmless; only LLM generation and the group cascade are gated).
         ensureEditorAliasesField();
-        syncEditorAliasesMode();
+        syncEditorAliasesButtonState();
         if (!isEnabled()) {
             removeInjected();
             return;
