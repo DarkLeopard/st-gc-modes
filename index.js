@@ -1429,6 +1429,7 @@ async function onBulkAliasFill() {
             }
             ok += 1;
             console.log(LOG_PREFIX, 'bulk aliases written:', ch.name, '->', aliases.length, 'items');
+            if (getEditorChid() === chid) syncEditorAliasesMode(); // the character is open in the editor: re-read the freshly saved card into the form
         }
         if (typeof toastr !== 'undefined' && typeof toastr.info === 'function') {
             toastr.info(localize('bulkDoneToast').replace('{ok}', () => String(ok)).replace('{total}', () => String(targets.length)), MODULE_NAME);
