@@ -1,0 +1,1109 @@
+// st-gc-modes — SillyTavern third-party UI extension.
+// Adds two extra group-reply modes to group chats:
+//   4 = Smart — direct alias matching (У1), then one quiet director request (У2/У3), then a "(nobody)" note in chat (У4);
+//   5 = Alias — pure alias-signal matching (У1) with no LLM request at all.
+// ES2022, plain ES module, no build step, no npm dependencies.
+// Core SillyTavern is never patched: the extension only injects DOM and listens to events.
+
+import { eventSource, event_types, Generate, generateRaw, addOneMessage, chat, characters, name1, saveChatConditional, is_send_press, saveSettingsDebounced } from '../../../../script.js';
+import { getMessageTimeStamp } from '../../../RossAscends-mods.js';
+import { extension_settings, getContext } from '../../../extensions.js';
+import { groups, selected_group, editGroup, is_group_generating } from '../../../group-chats.js';
+import { getCurrentLocale } from '../../../i18n.js';
+import { waitUntilCondition } from '../../../utils.js';
+import { Fuse } from '../../../../lib.js';
+
+// ---- constants ----
+
+const MODULE_NAME = 'st-gc-modes';
+const LOG_PREFIX = '[GCModes]';
+
+// Group reply strategy values owned by this extension (core uses 0..3).
+const STRATEGY_SMART = 4;
+const STRATEGY_ALIAS = 5;
+
+// Unicode-aware word tokenizer: a word starts with a letter and may continue with letters, marks,
+// digits, apostrophes and hyphens. Works for Latin, Cyrillic and any other script.
+const WORD_RE = /\p{L}[\p{L}\p{M}\p{N}'-]*/gu;
+
+// Lowercased tokens that mean "no one" in a quiet-model reply (English + Russian).
+const NONE_TOKENS = new Set(['none', 'no one', 'nobody', 'noone', 'нико', 'никто', 'никого', 'никем', 'никуда', 'никому']);
+
+// Marker stored on message.extra for the У4 "nobody" note pushed by this extension.
+const NOTE_FLAG = 'st_gc_modes_note';
+
+// Bounds and delays (all timeouts in milliseconds).
+const PROCESSED_LIMIT = 100;       // size of the dedupe FIFO for processed cascade keys
+const CASCADE_DELAY = 50;          // defer so the core group wrapper finishes before any Generate call
+const IDLE_WAIT_TIMEOUT = 15000;   // wait for the group to become idle before running a cascade
+const IDLE_WAIT_INTERVAL = 100;
+const MEMBER_IDLE_TIMEOUT = 60000; // wait for idle before each forced member reply
+const MEMBER_IDLE_INTERVAL = 200;
+const QUIET_RAW_LIMIT = 300;       // quietRaw kept in debug stats, truncated
+const ANSWER_LEN_WARN = 400;       // warn (but still parse) above this answer length
+const DESC_LIMIT = 200;            // description slice shown to the director prompt
+
+// ---- i18n ----
+
+// All user-visible strings. Chosen once per render via isRussianUI(); no live language switching.
+const UI_TEXT = {
+    en: {
+        panelTitle: 'Smart / Alias group modes', panelInstructions: 'Smart: director instructions',
+        panelDepth: 'Context depth {n} (last messages)', panelL2: 'У2: indirect address (profession/attribute)',
+        panelL3: 'У3: motivation to join', panelNote: 'У4: "(nobody)" note in chat',
+        panelCeiling: 'Responders cap (default)', ceilingNone: 'none',
+        aliasTitle: 'Alias signals (comma separated)', aliasRefresh: 'Update list',
+        columnName: 'Character', columnSignals: 'Signals',
+        groupCeilingLabel: 'Responders cap (this group)', groupCeilingDefault: '(default)', groupCeilingNone: 'none',
+        unknownNamesToast: 'st-gc-modes: unknown name in reply: {names}',
+        quietFailedToast: 'st-gc-modes: quiet request failed, skipping levels 2/3',
+        noteNobody: '(Nobody joined the conversation.)',
+    },
+    ru: {
+        panelTitle: 'Smart / Alias режимы группы', panelInstructions: 'Smart: инструкции режиссёра',
+        panelDepth: 'Глубина контекста {n} (последние сообщения)', panelL2: 'У2: косвенное обращение (профессия/признак)',
+        panelL3: 'У3: мотивация вступить', panelNote: 'У4: заметка "(никто)" в чате',
+        panelCeiling: 'Лимит отвечающих (по умолчанию)', ceilingNone: 'нет',
+        aliasTitle: 'Сигналы-алиасы (через запятую)', aliasRefresh: 'Обновить список',
+        columnName: 'Персонаж', columnSignals: 'Сигналы',
+        groupCeilingLabel: 'Лимит отвечающих (группа)', groupCeilingDefault: '(по умолчанию)', groupCeilingNone: 'нет',
+        unknownNamesToast: 'st-gc-modes: неизвестные имена в ответе: {names}',
+        quietFailedToast: 'st-gc-modes: тихий запрос не удался, уровни 2/3 пропущены',
+        noteNobody: '(Никто не вступил в разговор.)',
+    },
+};
+
+/** Tells whether the current UI locale is Russian. @returns {boolean} True when the locale string starts with "ru". */
+function isRussianUI() {
+    try {
+        return String(getCurrentLocale()).toLowerCase().startsWith('ru');
+    } catch {
+        return false;
+    }
+}
+
+/** Looks up a UI string for the active locale, falling back to English, then to the key itself.
+ * @param {string} key Key inside UI_TEXT. @returns {string} Localized string. */
+function localize(key) {
+    const lang = isRussianUI() ? 'ru' : 'en';
+    const table = UI_TEXT[lang] ?? UI_TEXT.en;
+    if (Object.prototype.hasOwnProperty.call(table, key)) return table[key];
+    return Object.prototype.hasOwnProperty.call(UI_TEXT.en, key) ? UI_TEXT.en[key] : key;
+}
+
+// ---- settings ----
+
+// Default instructions for the Smart "director" quiet request (У2/У3). Editable in the panel.
+const DEFAULT_SMART_INSTRUCTIONS = [
+    'You are the group-chat director choosing which characters join the conversation.',
+    'You receive: participant list (name + short description), recent chat, and the last user message.',
+    'Pick ONLY participants who would realistically respond:',
+    '1. They were addressed by an indirect sign instead of their name (their profession, role, place, or a personal attribute from their description).',
+    '2. They have their own motivation, reason, or duty to chime in right now.',
+    'Do not pick anyone out of politeness. If several fit, list all. Answer format: participant names separated by commas, copied exactly as given in the list. If no one fits, answer exactly: none.',
+].join('\n');
+
+// Module settings: merged one level deep from defaults on init.
+const DEFAULT_SETTINGS = {
+    smart_instructions: DEFAULT_SMART_INSTRUCTIONS,
+    context_depth: 10,        // integer 1..50, how many last chat messages go into a quiet request
+    level2Enabled: true,      // У2 indirect address
+    level3Enabled: true,      // У3 motivation to join
+    nobodyNote: true,         // У4 "(nobody)" note in chat
+    ceiling: 2,               // default responders cap: 2 | 3 | 4 | 5 | 0 (= none/unlimited)
+    aliasSignals: {},         // avatar filename -> array of signal strings (editable in panel)
+};
+
+let settings = null;
+
+/** Ensures extension_settings[MODULE_NAME] exists and merges missing default keys (one level deep, cloning object
+ * defaults to avoid shared references), saving once when something was added.
+ * @returns {object} The module settings object (live reference into extension_settings). */
+function loadSettings() {
+    if (typeof extension_settings[MODULE_NAME] !== 'object' || extension_settings[MODULE_NAME] === null || Array.isArray(extension_settings[MODULE_NAME])) {
+        extension_settings[MODULE_NAME] = {};
+    }
+    const stored = extension_settings[MODULE_NAME];
+    let added = false;
+    for (const key of Object.keys(DEFAULT_SETTINGS)) {
+        if (Object.prototype.hasOwnProperty.call(stored, key)) continue;
+        const value = DEFAULT_SETTINGS[key];
+        stored[key] = (typeof value === 'object' && value !== null) ? structuredClone(value) : value;
+        added = true;
+    }
+    if (added) saveSettingsDebounced();
+    return stored;
+}
+
+/** Reads the context depth setting, clamped to the supported 1..50 range. @returns {number} Clamped context depth. */
+function clampDepth() {
+    const value = Math.round(Number(settings?.context_depth));
+    if (!Number.isFinite(value)) return DEFAULT_SETTINGS.context_depth;
+    return Math.min(50, Math.max(1, value));
+}
+
+// ---- utils ----
+
+/** Tokenizes text into lowercase Unicode words (letters, marks, digits, apostrophes, hyphens).
+ * @param {string} text Arbitrary input text. @returns {string[]} Lowercased word tokens. */
+function tokenize(text) {
+    return String(text ?? '').toLowerCase().match(WORD_RE) ?? [];
+}
+
+/** Collapses all whitespace runs into single spaces and trims the result.
+ * @param {string} text Arbitrary input text. @returns {string} Whitespace-collapsed text. */
+function collapseWhitespace(text) {
+    return String(text ?? '').replace(/\s+/g, ' ').trim();
+}
+
+/** Finds the index of a character in the global characters array by its avatar filename.
+ * @param {string} avatar Avatar filename (e.g. "seraphina.png"). @returns {number} Index into characters, or -1 when not found. */
+function findCharacterIndex(avatar) {
+    if (typeof avatar !== 'string' || avatar.length === 0) return -1;
+    return characters.findIndex(c => c?.avatar === avatar);
+}
+
+/** Resolves a member's display name from its avatar filename.
+ * @param {string} avatar Avatar filename. @returns {string} Character name, or the avatar string when the character is gone. */
+function avatarToName(avatar) {
+    const index = findCharacterIndex(avatar);
+    if (index === -1) return String(avatar);
+    return String(characters[index]?.name ?? avatar);
+}
+
+/** Splits a raw user-entered signal line into a clean list: split on ',;|', trim, drop empties and duplicates,
+ * keep the original order. @param {string} text Comma-separated signal input. @returns {string[]} Clean signal strings. */
+function parseSignalList(text) {
+    const out = [];
+    const seen = new Set();
+    for (const piece of String(text ?? '').split(/[,;|]+/u)) {
+        const trimmed = piece.trim();
+        if (trimmed.length === 0 || seen.has(trimmed)) continue;
+        seen.add(trimmed);
+        out.push(trimmed);
+    }
+    return out;
+}
+
+// ---- state ----
+
+// Queued { messageId, chatId, sendDate } items waiting for their cascade to run (FIFO, serialized).
+const pendingCascades = [];
+let cascadeScheduled = false; // a runner timeout is pending (or in its first tick)
+let isCascadeActive = false;  // a cascade is currently awaiting inside runCascadeFor
+const processedKeys = new Set(); // bounded FIFO Set of dedupe keys `${chatId}::${idx}::${send_date}`
+let lastCascade = null;       // debug stats object of the most recent cascade run
+let injectLogged = false;     // the single one-time "options injected" debug line
+let aliasPrefillLogged = false; // the single one-time "alias table prefilled" debug line
+const cascadeStats = { messagesSeen: 0, cascadesRun: 0, level1Hits: 0, quietCalls: 0, generationsPushed: 0, notes: 0 };
+
+// ---- group helpers ----
+
+/** Finds the currently open group; selected_group is normally a string id but the comparison stays tolerant.
+ * @returns {object|null} The active group object, or null when no group is open. */
+function getActiveGroup() {
+    if (!selected_group) return null;
+    return groups.find(g => typeof selected_group === 'string' ? String(g.id) === selected_group : g.id === selected_group) ?? null;
+}
+
+/** Reads the reply strategy value of the active group for the debug hook.
+ * @returns {number|null} Strategy number, or null when no group is open. */
+function activeGroupStrategy() {
+    const group = getActiveGroup();
+    if (!group) return null;
+    const strategy = Number(group.activation_strategy);
+    return Number.isFinite(strategy) ? strategy : null;
+}
+
+/** Ensures the group object has the custom st_gc_modes field used for per-group overrides; it persists server-side
+ * because /api/groups/edit writes the whole group object.
+ * @param {object} group Active group object. @returns {object} The (existing or newly created) st_gc_modes object. */
+function ensureStGcModes(group) {
+    if (!group) return null;
+    if (typeof group.st_gc_modes !== 'object' || group.st_gc_modes === null) group.st_gc_modes = {};
+    return group.st_gc_modes;
+}
+
+const CEILING_VALUES = new Set([0, 2, 3, 4, 5]);
+
+/** Effective responders cap: the per-group override when it is an allowed value, otherwise the module default
+ * (also clamped); 0 means unlimited. @param {object|null} group Active group object (may be null). @returns {number} Cap value (0 = unlimited). */
+function effectiveCeiling(group) {
+    const stored = group?.st_gc_modes;
+    if (stored && stored.ceiling !== null && CEILING_VALUES.has(Number(stored.ceiling))) return Number(stored.ceiling);
+    const fallback = Number(settings?.ceiling);
+    return CEILING_VALUES.has(fallback) ? fallback : DEFAULT_SETTINGS.ceiling;
+}
+
+/** Applies the responders cap to a matched avatar list, preserving order; logs the trimmed names when somebody gets cut.
+ * @param {string[]} avatars Matched member avatar filenames (group member order). @param {object} group Active group object.
+ * @returns {string[]} Trimmed list (same array when no trimming happened). */
+function applyCeiling(avatars, group) {
+    if (!Array.isArray(avatars) || avatars.length === 0) return [];
+    const ceiling = effectiveCeiling(group);
+    if (!(ceiling > 0) || avatars.length <= ceiling) return avatars;
+    const trimmedNames = avatars.slice(ceiling).map(avatarToName);
+    if (lastCascade) lastCascade.trimmedByCeiling = trimmedNames;
+    console.log(LOG_PREFIX, `ceiling ${ceiling} trimmed [${trimmedNames.join(', ')}]`);
+    return avatars.slice(0, ceiling);
+}
+
+/** Members of a group that are currently enabled (not muted) in group member order.
+ * @param {object} group Active group object. @returns {string[]} Enabled member avatar filenames. */
+function enabledMembersOf(group) {
+    const members = Array.isArray(group?.members) ? group.members : [];
+    const disabled = new Set(Array.isArray(group?.disabled_members) ? group.disabled_members : []);
+    return members.filter(avatar => !disabled.has(avatar));
+}
+
+// ---- alias signals ----
+
+/** Raw alias table entry for a member: settings.aliasSignals[avatar] when it is an array, else null.
+ * @param {string} avatar Avatar filename. @param {string} _name Character name (unused, kept for signature clarity).
+ * @returns {string[]|null} Table signals or null when no entry exists. */
+function memberSignals(avatar, _name) {
+    const entry = settings?.aliasSignals?.[avatar];
+    return Array.isArray(entry) ? entry : null;
+}
+
+/** Effective signal list for У1: the alias table entry unioned with the character's full name, which is always
+ * checked implicitly. Deduplicated case-insensitively.
+ * @param {string} avatar Avatar filename. @param {string} name Character name.
+ * @returns {string[]} Signals (may be single- or multi-word strings). */
+function effectiveSignals(avatar, name) {
+    const out = [];
+    const seen = new Set();
+    const add = (signal) => {
+        const key = String(signal).toLowerCase();
+        if (key.length > 0 && !seen.has(key)) {
+            seen.add(key);
+            out.push(String(signal));
+        }
+    };
+    const table = memberSignals(avatar, name);
+    if (Array.isArray(table)) {
+        for (const signal of table) {
+            if (typeof signal === 'string') add(signal);
+        }
+    }
+    if (typeof name === 'string') add(name);
+    return out;
+}
+
+/** Whether any of the member's signals matches the message token set: single-word signals require exact token
+ * equality, multi-word signals require ALL of their tokens to be present (unordered).
+ * @param {Set<string>} tokenSet Lowercased message tokens. @param {string[]} signals Full name + table signals.
+ * @returns {boolean} True when at least one signal matched. */
+function memberSignalsMatch(tokenSet, signals) {
+    for (const signal of signals) {
+        const signalTokens = tokenize(signal);
+        if (signalTokens.length === 0) continue;
+        if (signalTokens.length === 1) {
+            if (tokenSet.has(signalTokens[0])) return true;
+        } else if (signalTokens.every(token => tokenSet.has(token))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/** Prefill signal list for a character without a table entry: [ name, first-three-letters-of-name ]; unique and
+ * non-empty, users are expected to edit them (e.g. add the Cyrillic spelling).
+ * @param {string} name Character name. @returns {string[]} Prefill signals. */
+function buildPrefillSignals(name) {
+    const raw = String(name ?? '').trim();
+    const stem = (raw.split(/\s+/u)[0] ?? '').slice(0, 3);
+    const out = [];
+    if (raw.length > 0) out.push(raw);
+    if (stem.length > 0 && stem.toLowerCase() !== raw.toLowerCase()) out.push(stem);
+    return out;
+}
+
+/** Prefills the alias table for enabled group members that have no entry yet; collects all additions and performs
+ * a single saveSettingsDebounced() when anything was added. Called on GROUP_UPDATED / CHAT_CHANGED when the active
+ * group runs Smart or Alias.
+ * @param {string[]} groupMembers Enabled member avatar filenames. */
+function ensureSignalPrefill(groupMembers) {
+    let added = false;
+    for (const avatar of groupMembers) {
+        if (typeof settings.aliasSignals[avatar] !== 'undefined') continue;
+        const index = findCharacterIndex(avatar);
+        if (index === -1) continue;
+        const prefill = buildPrefillSignals(characters[index]?.name);
+        if (prefill.length > 0) {
+            settings.aliasSignals[avatar] = prefill;
+            added = true;
+        }
+    }
+    if (added) saveSettingsDebounced();
+}
+
+// ---- level 1 (direct/alias matching) ----
+
+/** У1: members whose name or alias signals appear in the user message, in group member order.
+ * @param {string} inputText Raw user message text. @param {string[]} memberList Enabled member avatar filenames.
+ * @returns {string[]} Matched member avatar filenames. */
+function level1Matches(inputText, memberList) {
+    const tokenSet = new Set(tokenize(inputText));
+    if (tokenSet.size === 0) return [];
+    const matched = [];
+    for (const avatar of memberList) {
+        const index = findCharacterIndex(avatar);
+        if (index === -1) continue;
+        const signals = effectiveSignals(avatar, String(characters[index]?.name ?? ''));
+        if (signals.length > 0 && memberSignalsMatch(tokenSet, signals)) matched.push(avatar);
+    }
+    return matched;
+}
+
+// ---- quiet request (У2/У3 smart part) ----
+
+/** Builds the two-sentence closing question for the director prompt depending on enabled levels.
+ * @returns {string} The Question: line content. */
+function buildQuietQuestion() {
+    const l2 = !!settings.level2Enabled;
+    const l3 = !!settings.level3Enabled;
+    if (l2 && l3) {
+        return 'Which of the participants should respond to the LAST message according to the enabled criteria? Answer only with participant names copied exactly from the list, separated by commas, or reply none if nobody fits.';
+    }
+    if (l2) {
+        return 'Which of the participants is addressed in the LAST message by an indirect sign instead of their name? Answer only with participant names copied exactly from the list, separated by commas, or reply none if nobody fits.';
+    }
+    return 'Which of the participants has their own motivation or duty to chime in after the LAST message? Answer only with participant names copied exactly from the list, separated by commas, or reply none if nobody fits.';
+}
+
+/** Builds the single-string director prompt: instructions, optional single-criterion line, participant list
+ * (name, aka signals, collapsed description), recent chat transcript and the question.
+ * @param {string} inputText Raw user message text. @param {string[]} memberList Enabled member avatar filenames.
+ * @returns {string} Prompt text. */
+function buildQuietPrompt(inputText, memberList) {
+    const blocks = [];
+    blocks.push(String(settings.smart_instructions ?? ''));
+
+    const l2 = !!settings.level2Enabled;
+    const l3 = !!settings.level3Enabled;
+    if (l2 && !l3) {
+        blocks.push('Apply ONLY criterion 2 (indirect address) and ignore criterion 3.');
+    } else if (!l2 && l3) {
+        blocks.push('Apply ONLY criterion 3 (their own motivation to chime in) and ignore criterion 2.');
+    }
+
+    const participantLines = [];
+    for (const avatar of memberList) {
+        const index = findCharacterIndex(avatar);
+        if (index === -1) {
+            continue;
+        }
+        const memberName = String(characters[index]?.name ?? '');
+        const signals = (memberSignals(avatar, memberName) ?? []).filter(signal => typeof signal === 'string' && signal.trim().length > 0);
+        const description = collapseWhitespace(String(characters[index]?.description ?? '')).slice(0, DESC_LIMIT) || '(no description)';
+        let line = `- Name: ${memberName}`;
+        if (signals.length > 0) {
+            line += ` (aka: ${signals.join(', ')})`;
+        }
+        line += ` — description: ${description}`;
+        participantLines.push(line);
+    }
+    blocks.push(['Participants:', ...participantLines].join('\n'));
+
+    const depth = clampDepth();
+    const transcript = [];
+    const recent = chat.filter(item => item && item.is_system !== true).slice(-depth);
+    for (const item of recent) {
+        let senderName;
+        if (item.is_user) {
+            senderName = String(item.name || name1);
+        } else {
+            const cid = Number(item.character_id ?? item.force_chid ?? Number.NaN);
+            senderName = String(item.name || (Number.isInteger(cid) ? characters[cid]?.name : undefined) || '?');
+        }
+        transcript.push(`${senderName}: ${String(item.mes ?? '')}`);
+    }
+    blocks.push([`Recent chat (oldest first, last ${depth} messages):`, ...transcript].join('\n'));
+
+    blocks.push(`Question: ${buildQuietQuestion()}`);
+    return blocks.join('\n\n');
+}
+
+/** Runs ONE quiet (raw) LLM request implementing the У2/У3 checks for Smart mode: generateRaw goes to the active
+ * API without a preset. Failures and empty answers are treated as "nobody" inputs downstream, never thrown.
+ * @param {string} inputText Raw user message text. @param {string[]} memberList Enabled member avatar filenames.
+ * @returns {Promise<string>} Trimmed model answer (may be empty). */
+async function quietLevelRequest(inputText, memberList) {
+    if (lastCascade) lastCascade.quietCalls += 1;
+    cascadeStats.quietCalls += 1;
+    console.log(LOG_PREFIX, `quiet request: start (${memberList.length} participants)`);
+
+    const prompt = buildQuietPrompt(inputText, memberList);
+    let answer = '';
+    try {
+        answer = await generateRaw({ prompt, systemPrompt: '' });
+    } catch (err) {
+        console.error(LOG_PREFIX, 'quiet request failed', err);
+        if (typeof toastr !== 'undefined' && typeof toastr.error === 'function') toastr.error(localize('quietFailedToast'), 'st-gc-modes');
+        return '';
+    }
+
+    const trimmed = String(answer ?? '').trim();
+    if (trimmed.length === 0) {
+        console.log(LOG_PREFIX, 'quiet request returned empty content (reasoning model?)');
+        return '';
+    }
+    if (trimmed.length > ANSWER_LEN_WARN) {
+        console.log(LOG_PREFIX, `quiet answer longer than ${ANSWER_LEN_WARN} chars (${trimmed.length}), parsing the first usable tokens anyway`);
+    }
+    if (lastCascade) lastCascade.quietRaw = trimmed.slice(0, QUIET_RAW_LIMIT);
+    return trimmed;
+}
+
+// ---- parsing the model answer ----
+
+/** Parses the director reply into a chosen avatar list (in model order, deduped) and a list of unrecognized raw
+ * tokens; "nobody" answers (NONE_TOKENS) collapse to an empty list.
+ * @param {string} answer Raw model answer. @param {string[]} memberList Enabled member avatar filenames.
+ * @returns {{chosen: string[], unknown: string[]}} Chosen avatars and unresolved tokens. */
+function parseQuietAnswer(answer, memberList) {
+    const chosen = [];
+    const unknown = [];
+    const rawParts = String(answer ?? '').split(/[,;\n\r]+/u).map(part => part.trim()).filter(part => part.length > 0);
+
+    // Drop tokens that are themselves a NONE_TOKEN ("none", "никто", "no one", ...). Surrounding punctuation
+    // and other non-letters are stripped first, so "None." or "None:" collapse to nobody too.
+    const stripEdges = (part) => part.replace(/^[^\p{L}\p{N}'-]+|[^\p{L}\p{N}'-]+$/gu, '');
+    let tokens = rawParts.filter(part => !NONE_TOKENS.has(stripEdges(part).toLowerCase()));
+    // When a single remaining token merely STARTS with a NONE_TOKEN word ("никто не подходит"), treat as nobody.
+    if (tokens.length === 1) {
+        const lower = tokens[0].toLowerCase();
+        const startsWithNoneWord = Array.from(NONE_TOKENS).some(token => lower === token || (lower.startsWith(token) && (lower.charAt(token.length) === ' ' || lower.length === token.length)));
+        if (startsWithNoneWord) tokens = [];
+    }
+    if (tokens.length === 0) return { chosen, unknown };
+
+    // Exact-match index: lowercased name and lowercased table signals -> avatar.
+    const exactIndex = new Map();
+    const labels = [];
+    for (const avatar of memberList) {
+        const index = findCharacterIndex(avatar);
+        if (index === -1) continue;
+        const memberName = String(characters[index]?.name ?? '');
+        if (memberName.length > 0) {
+            exactIndex.set(memberName.toLowerCase(), avatar);
+            labels.push({ label: memberName, avatar, name: memberName });
+        }
+        for (const signal of (memberSignals(avatar, memberName) ?? [])) {
+            if (typeof signal === 'string' && signal.trim().length > 0) {
+                exactIndex.set(signal.toLowerCase(), avatar);
+                labels.push({ label: signal, avatar, name: memberName });
+            }
+        }
+    }
+
+    // One Fuse over the flat labels of all enabled members for fuzzy fallback.
+    const fuse = new Fuse(labels, { keys: ['label'], ignoreLocation: true, threshold: 0.45, includeScore: true });
+    const taken = new Set();
+    for (const token of tokens) {
+        let avatar = exactIndex.get(token.toLowerCase());
+        if (!avatar && token.replace(/[^\p{L}\p{N}'-]/gu, '').length >= 4) {
+            // Fuzzy fallback only for reasonably long tokens: short ones and 3-letter prefill stems
+            // would fuzzy-match far too permissively.
+            const hits = fuse.search(token);
+            if (Array.isArray(hits) && hits.length > 0 && hits[0]?.item?.avatar) avatar = hits[0].item.avatar;
+        }
+        if (avatar) {
+            if (!taken.has(avatar)) {
+                taken.add(avatar);
+                chosen.push(avatar);
+            }
+        } else {
+            unknown.push(token);
+        }
+    }
+    return { chosen, unknown };
+}
+
+// ---- nobody note (У4) ----
+
+/** Pushes the localized "(nobody)" note into the chat as a user message flagged with extra[NOTE_FLAG].
+ * addOneMessage does not emit USER_MESSAGE_RENDERED, so no cascade recursion happens; the flag and the exact-text
+ * guard in the hook are defense in depth. */
+async function pushNobodyNote() {
+    const noteText = localize('noteNobody');
+    const message = {
+        name: name1,
+        is_user: true,
+        is_system: false,
+        send_date: getMessageTimeStamp(),
+        mes: noteText,
+        extra: { isSmallSys: false, [NOTE_FLAG]: true },
+    };
+    chat.push(message);
+    addOneMessage(message);
+    await saveChatConditional();
+    cascadeStats.notes += 1;
+    if (lastCascade) lastCascade.notePushed = true;
+    console.log(LOG_PREFIX, 'nobody note pushed');
+}
+
+// ---- cascade runner ----
+
+/** USER_MESSAGE_RENDERED handler. Validates the rendered user message, then — never awaiting — queues a cascade
+ * item and schedules the detached runner. Nothing here may await generation: while the core wrapper is still
+ * executing, is_group_generating is true and any nested Generate call would be silently ignored.
+ * @param {number} idx Chat array INDEX of the rendered message (not the message object). */
+function onUserMessageRendered(idx) {
+    try {
+        const message = chat[Number(idx)];
+        if (!message) return;
+        cascadeStats.messagesSeen += 1;
+        if (message.is_user !== true || message.is_system !== false) return;
+        if (message.extra?.[NOTE_FLAG]) return;
+        if (String(message.mes ?? '') === localize('noteNobody')) return;
+        const group = getActiveGroup();
+        if (!group) return;
+        const strategy = Number(group.activation_strategy);
+        if (strategy !== STRATEGY_SMART && strategy !== STRATEGY_ALIAS) return;
+        pendingCascades.push({ messageId: idx, chatId: String(getContext()?.chatId ?? ''), sendDate: String(message.send_date ?? '') });
+        enqueueCascadeRunner();
+        // Return immediately — the cascade runs detached.
+    } catch (err) {
+        console.error(LOG_PREFIX, 'user message hook failed:', err);
+    }
+}
+
+/** Schedules the single cascade runner (detached setTimeout with CASCADE_DELAY, so the core group wrapper finishes
+ * first); the while loop serializes cascades — a second queued user message waits for the first cascade to finish. */
+function enqueueCascadeRunner() {
+    if (cascadeScheduled) return;
+    cascadeScheduled = true;
+    setTimeout(async () => {
+        try {
+            while (pendingCascades.length > 0) {
+                const item = pendingCascades.shift();
+                isCascadeActive = true;
+                try {
+                    await runCascadeFor(item);
+                } catch (err) {
+                    console.error(LOG_PREFIX, 'cascade runner error:', err);
+                } finally {
+                    isCascadeActive = false;
+                }
+            }
+        } finally {
+            // The flag stays true for the whole drain, so a USER_MESSAGE_RENDERED arriving mid-loop cannot
+            // schedule a second runner; re-arm synchronously when items arrived after the final check.
+            cascadeScheduled = false;
+            if (pendingCascades.length > 0) enqueueCascadeRunner();
+        }
+    }, CASCADE_DELAY);
+}
+
+/** Waits until the group is idle (no pending send and no running group wrapper); used before the cascade and again
+ * before each sequential forced member reply.
+ * @param {number} timeout Wait limit in milliseconds. @param {number} interval Poll interval in milliseconds.
+ * @returns {Promise<boolean>} True when idle was confirmed, false on timeout. */
+async function waitGroupIdle(timeout, interval) {
+    try {
+        await waitUntilCondition(() => !is_send_press && !is_group_generating, timeout, interval);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+/** Clears the send textarea exactly like the core /trigger pattern does, once per cascade before the first
+ * invocation; silently skips when the textarea is missing (UI variants). */
+function clearTextboxDefensively() {
+    try {
+        const textbox = $('#send_textarea');
+        if (textbox.length > 0) textbox.val('')[0].dispatchEvent(new Event('input', { bubbles: true }));
+    } catch {
+        // Non-fatal: the textarea may not exist in this UI variant.
+    }
+}
+
+/** Runs the full cascade for one queued item: idle wait, re-validation, dedupe, У1, optional quiet request (У2/У3),
+ * У4 note and sequential forced member invocation.
+ * @param {{messageId: number|string, chatId: string, sendDate: string}} item Queued cascade item. */
+async function runCascadeFor(item) {
+    // 1) Wait until the group chat is idle (wrapper finished, nothing being sent).
+    if (!(await waitGroupIdle(IDLE_WAIT_TIMEOUT, IDLE_WAIT_INTERVAL))) {
+        console.warn(LOG_PREFIX, 'cascade dropped: group still busy (idle wait timeout)');
+        return;
+    }
+
+    // 2) Re-validate the queued item against the current state; drop silently stale ones.
+    const currentChatId = String(getContext()?.chatId ?? '');
+    if (currentChatId !== item.chatId) {
+        console.log(LOG_PREFIX, 'cascade dropped: chat changed since enqueue');
+        return;
+    }
+    const group = getActiveGroup();
+    if (!group) {
+        console.log(LOG_PREFIX, 'cascade dropped: no active group');
+        return;
+    }
+    const strategy = Number(group.activation_strategy);
+    if (strategy !== STRATEGY_SMART && strategy !== STRATEGY_ALIAS) {
+        console.log(LOG_PREFIX, 'cascade dropped: reply strategy changed');
+        return;
+    }
+    const index = Number(item.messageId);
+    const message = chat[index];
+    if (!message || message.is_user !== true || String(message.send_date ?? '') !== String(item.sendDate ?? '')) {
+        console.log(LOG_PREFIX, 'cascade dropped: queued message changed (stale or swipe)');
+        return;
+    }
+    if (message.extra?.[NOTE_FLAG]) return;
+
+    // 3) Cheap dedupe: mark processed (bounded FIFO Set keyed by chat, index and send date).
+    const dedupeKey = `${currentChatId}::${index}::${String(message.send_date ?? '')}`;
+    if (processedKeys.has(dedupeKey)) {
+        console.log(LOG_PREFIX, 'cascade skipped: duplicate event for the same message');
+        return;
+    }
+    processedKeys.add(dedupeKey);
+    while (processedKeys.size > PROCESSED_LIMIT) processedKeys.delete(processedKeys.values().next().value);
+
+    // 4) Debug stats object for this run.
+    const mode = strategy === STRATEGY_ALIAS ? 'alias' : 'smart';
+    const inputText = String(message.mes ?? '');
+    lastCascade = {
+        startedAt: Date.now(), finishedAt: null, mode: mode, input: inputText,
+        level1HitNames: [], quietCalls: 0, quietRaw: '', parsedNames: [], unknownNames: [],
+        chosenNames: [], trimmedByCeiling: [], notePushed: false, invocations: [], error: null,
+    };
+    cascadeStats.cascadesRun += 1;
+
+    try {
+        const members = enabledMembersOf(group);
+
+        // У1 — direct signals.
+        const level1 = level1Matches(inputText, members);
+        lastCascade.level1HitNames = level1.map(avatarToName);
+
+        if (mode === 'smart' && level1.length > 0) {
+            // Smart fast path: direct match found, no quiet request at all.
+            cascadeStats.level1Hits += 1;
+            const chosen = applyCeiling(level1, group);
+            lastCascade.chosenNames = chosen.map(avatarToName);
+            console.log(LOG_PREFIX, 'У1 hit (no quiet request)');
+            await invokeMembers(chosen, item);
+            return;
+        }
+
+        if (mode === 'alias') {
+            // Alias only has У1; empty means silence — never a note.
+            if (level1.length > 0) {
+                cascadeStats.level1Hits += 1;
+                const chosen = applyCeiling(level1, group);
+                lastCascade.chosenNames = chosen.map(avatarToName);
+                console.log(LOG_PREFIX, `Alias: signals hit: ${lastCascade.level1HitNames.join(', ')}`);
+                await invokeMembers(chosen, item);
+            } else {
+                console.log(LOG_PREFIX, 'Alias: no signals');
+            }
+            return;
+        }
+
+        // Smart, У1 empty: one quiet request covering the enabled levels, or nobody path.
+        let parsed = { chosen: [], unknown: [] };
+        if (settings.level2Enabled || settings.level3Enabled) {
+            const answer = await quietLevelRequest(inputText, members);
+            parsed = parseQuietAnswer(answer, members);
+            lastCascade.parsedNames = parsed.chosen.map(avatarToName);
+            lastCascade.unknownNames = parsed.unknown.slice();
+            console.log(LOG_PREFIX, `quiet request: end, parsed: [${lastCascade.parsedNames.join(', ')}]`);
+            if (parsed.unknown.length > 0) {
+                const rawUnknownText = localize('unknownNamesToast').replace('{names}', parsed.unknown.join(', '));
+                console.log(LOG_PREFIX, rawUnknownText);
+                // toastr renders the message as HTML: strip HTML-special characters from model-derived
+                // tokens before they are joined into the toast text.
+                const safeNames = parsed.unknown.map(token => String(token).replace(/[<>&"'\u0060]/g, '')).join(', ');
+                const unknownText = localize('unknownNamesToast').replace('{names}', () => safeNames);
+                if (typeof toastr !== 'undefined' && typeof toastr.info === 'function') toastr.info(unknownText, 'st-gc-modes');
+            }
+        }
+
+        const chosen = applyCeiling(parsed.chosen, group);
+        lastCascade.chosenNames = chosen.map(avatarToName);
+        if (chosen.length === 0) {
+            // Nobody path: Smart mode only, honor the У4 setting.
+            if (settings.nobodyNote) {
+                await pushNobodyNote();
+            } else {
+                console.log(LOG_PREFIX, 'nobody matched: staying silent (У4 note is disabled)');
+            }
+            return;
+        }
+        await invokeMembers(chosen, item);
+    } catch (err) {
+        lastCascade.error = String(err?.message ?? err);
+        console.error(LOG_PREFIX, 'cascade failed:', err);
+    } finally {
+        lastCascade.finishedAt = Date.now();
+    }
+}
+
+// ---- invocation ----
+
+/** Triggers the chosen members sequentially with the /trigger pattern (Generate('normal') with force_chid), one
+ * member at a time as the core queue requires; aborts the loop when the chat changed or the strategy is no longer
+ * Smart/Alias.
+ * @param {string[]} chosen Member avatar filenames to invoke. @param {{chatId: string}} item Originating cascade item (for context checks). */
+async function invokeMembers(chosen, item) {
+    if (!Array.isArray(chosen) || chosen.length === 0) return;
+    // Defensive textarea clear exactly once, before the FIRST invocation (like /trigger).
+    clearTextboxDefensively();
+    for (const avatar of chosen) {
+        // Abort when the chat changed or the strategy no longer applies.
+        if (String(getContext()?.chatId ?? '') !== item.chatId) {
+            console.log(LOG_PREFIX, 'invocation stopped: chat changed');
+            break;
+        }
+        const group = getActiveGroup();
+        const strategy = group ? Number(group.activation_strategy) : Number.NaN;
+        if (strategy !== STRATEGY_SMART && strategy !== STRATEGY_ALIAS) {
+            console.log(LOG_PREFIX, 'invocation stopped: reply strategy changed');
+            break;
+        }
+        const chid = findCharacterIndex(avatar);
+        if (chid === -1) {
+            console.log(LOG_PREFIX, `invocation skipped: character for avatar ${avatar} not found`);
+            continue;
+        }
+        await invokeMember(chid);
+    }
+}
+
+/** Invokes a single group member: waits for idle, then forces its reply via Generate; every failure is logged and
+ * swallowed so the next member still gets its turn.
+ * @param {number} chid Character index (into characters) of the member to invoke. */
+async function invokeMember(chid) {
+    const memberName = String(characters[chid]?.name ?? 'unknown');
+    const invocationEntry = { name: memberName, ok: false };
+    if (!(await waitGroupIdle(MEMBER_IDLE_TIMEOUT, MEMBER_IDLE_INTERVAL))) {
+        console.warn(LOG_PREFIX, `idle wait timed out before invoking ${memberName}`);
+        invocationEntry.error = 'idle wait timeout';
+        if (lastCascade) lastCascade.invocations.push(invocationEntry);
+        return;
+    }
+    try {
+        await Generate('normal', { force_chid: chid });
+        cascadeStats.generationsPushed += 1;
+        invocationEntry.ok = true;
+    } catch (err) {
+        console.error(LOG_PREFIX, `generation for ${memberName} failed:`, err);
+        invocationEntry.error = String(err?.message ?? err);
+    }
+    if (lastCascade) lastCascade.invocations.push(invocationEntry);
+}
+
+// ---- injection (strategy options + per-group ceiling widget) ----
+
+/** Idempotently injects the Smart/Alias options into the group reply strategy select and installs the per-group
+ * responders-cap widget right after the strategy select's flex container. Runs cheaply on every context hook and
+ * retries automatically when the DOM is not ready yet; never throws. */
+function injectStrategyOptions() {
+    let injected = false;
+    try {
+        const select = $('#rm_group_activation_strategy');
+        if (select.length === 0) return; // Page not loaded yet; retried on every APP_READY / CHAT_CHANGED / GROUP_UPDATED.
+        if (select.find('option[value="4"]').length === 0) {
+            select.append('<option value="4">Smart</option>');
+            select.append('<option value="5">Alias</option>');
+            injected = true;
+        }
+        injected = injectCeilingWidget(select) || injected;
+        syncStrategySelect();
+        syncGroupCeilingWidget();
+        if (injected && !injectLogged) {
+            injectLogged = true;
+            console.log(LOG_PREFIX, 'strategy options and responders-cap widget injected');
+        }
+    } catch (err) {
+        console.error(LOG_PREFIX, 'injection failed:', err);
+    }
+}
+
+/** Creates and mounts the per-group responders-cap widget once, directly after the flex container that holds the
+ * strategy select; the widget is only visible while the group panel is open because it lives in the same group
+ * form container.
+ * @param {JQuery} strategySelect The #rm_group_activation_strategy element. @returns {boolean} True when the widget was created by this call. */
+function injectCeilingWidget(strategySelect) {
+    if ($('#stgcmodes_group_ceiling_wrap').length > 0) return false;
+    const anchor = strategySelect.closest('div.flex1');
+    if (anchor.length === 0) return false; // Anchor layout differs; retried on the next context hook.
+    const wrap = $('<div>').attr('id', 'stgcmodes_group_ceiling_wrap').addClass('flex1 flexGap5');
+    const label = $('<label>').attr('for', 'stgcmodes_group_ceiling').addClass('flexnowrap width100p whitespacenowrap');
+    const labelText = $('<span>').attr('id', 'stgcmodes_group_ceiling_label').text(localize('groupCeilingLabel'));
+    const valueSelect = $('<select>').attr('id', 'stgcmodes_group_ceiling');
+    $('<option>').attr('value', 'default').text(localize('groupCeilingDefault')).appendTo(valueSelect);
+    for (const value of ['2', '3', '4', '5']) {
+        $('<option>').attr('value', value).text(value).appendTo(valueSelect);
+    }
+    $('<option>').attr('value', '0').text(localize('groupCeilingNone')).appendTo(valueSelect);
+    label.append(labelText);
+    wrap.append(label).append(valueSelect);
+    anchor.after(wrap);
+    valueSelect.on('change', onGroupCeilingChange);
+    return true;
+}
+
+/** Change handler for the per-group ceiling widget: writes st_gc_modes.ceiling onto the open group object (null
+ * for "default") and persists the whole group via editGroup. */
+function onGroupCeilingChange() {
+    try {
+        const raw = String($('#stgcmodes_group_ceiling').val() ?? 'default');
+        const group = getActiveGroup();
+        if (!group || !selected_group) {
+            console.warn(LOG_PREFIX, 'ceiling change ignored: no active group');
+            return;
+        }
+        const stored = ensureStGcModes(group);
+        stored.ceiling = (raw === 'default') ? null : Number(raw);
+        editGroup(selected_group, true, false).catch(err => console.error(LOG_PREFIX, 'failed to save group ceiling override:', err));
+        console.log(LOG_PREFIX, `group ceiling override set to ${raw === 'default' ? 'default' : String(stored.ceiling)}`);
+    } catch (err) {
+        console.error(LOG_PREFIX, 'failed to save group ceiling override:', err);
+    }
+}
+
+/** Syncs the strategy select with the open group — only filling gaps: it never overwrites a value the user has
+ * just selected mid-edit. */
+function syncStrategySelect() {
+    const select = $('#rm_group_activation_strategy');
+    if (select.length === 0) return;
+    const group = getActiveGroup();
+    if (!group) return;
+    const strategy = Number(group.activation_strategy);
+    if (strategy !== STRATEGY_SMART && strategy !== STRATEGY_ALIAS) return;
+    const value = String(strategy);
+    if (select.val() !== value) select.val(value);
+}
+
+/** Syncs the per-group ceiling widget with the open group's stored override: a number shows as that option,
+ * null/absent shows as "(default)". */
+function syncGroupCeilingWidget() {
+    const valueSelect = $('#stgcmodes_group_ceiling');
+    if (valueSelect.length === 0) return;
+    const override = getActiveGroup()?.st_gc_modes;
+    const value = (override && Number.isFinite(override.ceiling) && override.ceiling !== null) ? String(Number(override.ceiling)) : 'default';
+    if (valueSelect.val() !== value) valueSelect.val(value);
+}
+
+// ---- settings panel ----
+
+/** Renders the st-gc-modes settings drawer into the extensions settings container. The static HTML skeleton
+ * contains no dynamic values: every label is filled through .text() from UI_TEXT and every dynamic value goes
+ * through .val()/.prop(). */
+function renderSettingsPanel() {
+    const target = $('#extensions_settings2').length > 0 ? $('#extensions_settings2') : $('#extensions_settings');
+    if (target.length === 0) {
+        console.warn(LOG_PREFIX, 'settings container not found, panel not rendered');
+        return;
+    }
+    if ($('#stgcmodes_content').length > 0) return; // Already rendered (idempotent).
+
+    const skeleton = [
+        '<div class="stgcmodes"><div class="inline-drawer">',
+        '<div class="inline-drawer-toggle inline-drawer-header"><b><span class="stgcmodes_i18n" data-key="panelTitle"></span></b><div class="inline-drawer-icon fa-solid fa-chevron-down expander"></div></div>',
+        '<div class="inline-drawer-content" id="stgcmodes_content">',
+        '<div class="flex1">',
+        '<label for="stgcmodes_instructions" class="stgcmodes_label"><span class="stgcmodes_i18n" data-key="panelInstructions"></span></label>',
+        '<textarea id="stgcmodes_instructions" rows="6" spellcheck="false"></textarea>',
+        '</div>',
+        '<div class="flex1">',
+        '<label for="stgcmodes_depth" class="stgcmodes_label"><span id="stgcmodes_depth_label" class="stgcmodes_i18n" data-key="panelDepth"></span></label>',
+        '<input id="stgcmodes_depth" type="number" min="1" max="50" step="1" />',
+        '</div>',
+        '<label class="flex1 checkbox_label" for="stgcmodes_l2"><input id="stgcmodes_l2" type="checkbox" /><span class="stgcmodes_i18n" data-key="panelL2"></span></label>',
+        '<label class="flex1 checkbox_label" for="stgcmodes_l3"><input id="stgcmodes_l3" type="checkbox" /><span class="stgcmodes_i18n" data-key="panelL3"></span></label>',
+        '<label class="flex1 checkbox_label" for="stgcmodes_note"><input id="stgcmodes_note" type="checkbox" /><span class="stgcmodes_i18n" data-key="panelNote"></span></label>',
+        '<div class="flex1">',
+        '<label for="stgcmodes_ceiling" class="stgcmodes_label"><span class="stgcmodes_i18n" data-key="panelCeiling"></span></label>',
+        '<select id="stgcmodes_ceiling"></select>',
+        '</div>',
+        '<div class="flex1">',
+        '<span class="stgcmodes_i18n" data-key="aliasTitle"></span>',
+        '<div id="stgcmodes_alias"></div>',
+        '<button id="stgcmodes_alias_refresh" class="menu_button"><span class="stgcmodes_i18n" data-key="aliasRefresh"></span></button>',
+        '</div>',
+        '</div></div></div>',
+    ].join('\n');
+
+    target.append(skeleton);
+
+    // Fill every localized label through .text() — never interpolated into HTML strings.
+    $('#stgcmodes_content').find('.stgcmodes_i18n').each(function () {
+        $(this).text(localize(String($(this).attr('data-key'))));
+    });
+
+    // Director instructions textarea.
+    $('#stgcmodes_instructions').val(String(settings.smart_instructions ?? '')).on('input', function () {
+        settings.smart_instructions = String($(this).val() ?? '');
+        saveSettingsDebounced();
+    });
+
+    // Context depth with a live N in the label.
+    $('#stgcmodes_depth').val(String(clampDepth()));
+    updateDepthLabel();
+    $('#stgcmodes_depth').on('change', function () {
+        const raw = Math.round(Number($(this).val()));
+        const value = Number.isFinite(raw) ? Math.min(50, Math.max(1, raw)) : clampDepth();
+        $(this).val(String(value));
+        settings.context_depth = value;
+        saveSettingsDebounced();
+        updateDepthLabel();
+        console.log(LOG_PREFIX, `context depth set to ${value}`);
+    });
+
+    // Level checkboxes (У2 / У3 / У4).
+    for (const [id, key] of [['#stgcmodes_l2', 'level2Enabled'], ['#stgcmodes_l3', 'level3Enabled'], ['#stgcmodes_note', 'nobodyNote']]) {
+        $(id).prop('checked', !!settings[key]).on('change', function () {
+            settings[key] = !!$(this).prop('checked');
+            saveSettingsDebounced();
+        });
+    }
+
+    // Default responders cap select.
+    const ceilingSelect = $('#stgcmodes_ceiling');
+    for (const value of ['2', '3', '4', '5', '0']) {
+        $('<option>').attr('value', value).text((value === '0') ? localize('ceilingNone') : value).appendTo(ceilingSelect);
+    }
+    ceilingSelect.val(String(Number(settings.ceiling)));
+    ceilingSelect.on('change', function () {
+        const raw = String($(this).val() ?? '2');
+        const value = Number(raw);
+        settings.ceiling = Number.isFinite(value) ? value : DEFAULT_SETTINGS.ceiling;
+        saveSettingsDebounced();
+        console.log(LOG_PREFIX, `default responders cap set to ${raw === '0' ? 'none (unlimited)' : raw}`);
+    });
+
+    // Alias signal table: bordered scroll box, rendered now (the list is small).
+    renderAliasTable();
+    $('#stgcmodes_alias').attr('style', 'border:1px solid var(--SmartThemeBorderColor, #999);border-radius:10px;max-height:260px;overflow-y:auto;padding:5px;');
+    $('#stgcmodes_alias_refresh').on('click', renderAliasTable);
+}
+
+/** Updates the context depth label so it reads "Context depth N (last messages)" / RU equivalent. */
+function updateDepthLabel() {
+    const label = $('#stgcmodes_depth_label');
+    if (label.length === 0) return;
+    label.text(localize('panelDepth').replace('{n}', String(clampDepth())));
+}
+
+/** Renders the alias signals table from the current character list, sorted case-insensitively by name. Rows for
+ * characters without a table entry are prefilled (name + 3-letter stem) but saved only once at the end, and only
+ * when at least one entry was added. All cell content goes through .text()/.val() — never dynamic innerHTML. */
+function renderAliasTable() {
+    const box = $('#stgcmodes_alias');
+    if (box.length === 0) return;
+    box.empty();
+
+    const list = Array.from(getContext()?.characters ?? [])
+        .filter(entry => typeof entry?.avatar === 'string' && entry.avatar.length > 0)
+        .sort((a, b) => String(a?.name ?? '').toLowerCase().localeCompare(String(b?.name ?? '').toLowerCase()));
+
+    // Column header.
+    const headerRow = $('<div>').addClass('stgcmodes_alias_row');
+    headerRow.append($('<span>').addClass('stgcmodes_alias_name').text(localize('columnName')));
+    headerRow.append($('<span>').addClass('stgcmodes_alias_cell').text(localize('columnSignals')));
+    box.append(headerRow);
+
+    let added = false;
+    for (const entry of list) {
+        const avatar = String(entry.avatar);
+        const memberName = String(entry?.name ?? avatar);
+        if (!Array.isArray(settings.aliasSignals[avatar])) {
+            const prefill = buildPrefillSignals(memberName);
+            if (prefill.length > 0) {
+                settings.aliasSignals[avatar] = prefill;
+                added = true;
+            }
+        }
+        const signals = Array.isArray(settings.aliasSignals[avatar]) ? settings.aliasSignals[avatar] : [];
+
+        const row = $('<div>').addClass('stgcmodes_alias_row');
+        const nameSpan = $('<span>').addClass('stgcmodes_alias_name').text(memberName).attr('title', memberName);
+        const input = $('<input>').attr({ type: 'text', autocomplete: 'off', spellcheck: 'false' }).addClass('stgcmodes_alias_input').val(signals.join(', '));
+        $(input).on('change', function () {
+            settings.aliasSignals[avatar] = parseSignalList(String($(this).val() ?? ''));
+            saveSettingsDebounced();
+        });
+        row.append(nameSpan).append(input);
+        box.append(row);
+    }
+
+    if (added) {
+        saveSettingsDebounced();
+        if (!aliasPrefillLogged) {
+            aliasPrefillLogged = true;
+            console.log(LOG_PREFIX, 'alias table: prefilled entries for new characters');
+        }
+    }
+}
+
+// ---- debug/stats hook ----
+
+/** Publishes the window.__GCModes debug and test hook: live state, last cascade stats clone and the cumulative
+ * cascadeStats counter object. */
+function defineDebugHook() {
+    window.__GCModes = {
+        state: () => ({
+            running: cascadeScheduled || isCascadeActive,
+            queue: pendingCascades.length,
+            strategyOfActiveGroup: activeGroupStrategy(),
+        }),
+        last: () => (lastCascade ? structuredClone(lastCascade) : null),
+        stats: cascadeStats,
+    };
+}
+
+// ---- init ----
+
+/** Shared handler for context events (APP_READY, CHAT_CHANGED, GROUP_UPDATED): re-injects idempotently, syncs the
+ * widgets and prefills alias signals when the active group runs one of our strategies. */
+function onContextEvents() {
+    try {
+        injectStrategyOptions();
+        const group = getActiveGroup();
+        if (group) {
+            const strategy = Number(group.activation_strategy);
+            if (strategy === STRATEGY_SMART || strategy === STRATEGY_ALIAS) ensureSignalPrefill(enabledMembersOf(group));
+        }
+    } catch (err) {
+        console.error(LOG_PREFIX, 'context event handling failed:', err);
+    }
+}
+
+/** Registers the event listeners used by this extension: the three cheap context hooks and the
+ * USER_MESSAGE_RENDERED cascade entry point. */
+function registerEventListeners() {
+    try {
+        eventSource.on(event_types.APP_READY, onContextEvents);
+        eventSource.on(event_types.CHAT_CHANGED, onContextEvents);
+        eventSource.on(event_types.GROUP_UPDATED, onContextEvents);
+        eventSource.on(event_types.USER_MESSAGE_RENDERED, onUserMessageRendered);
+    } catch (err) {
+        console.error(LOG_PREFIX, 'failed to register event listeners:', err);
+    }
+}
+
+/** Module entry point: load settings, register hooks, inject once, render the panel and publish the debug hook.
+ * Kept quiet on purpose: at most two debug lines at load. */
+function initModule() {
+    try {
+        settings = loadSettings();
+        registerEventListeners();
+        injectStrategyOptions();
+        renderSettingsPanel();
+        defineDebugHook();
+        console.log(LOG_PREFIX, 'extension loaded');
+    } catch (err) {
+        console.error(LOG_PREFIX, 'initialization failed:', err);
+    }
+}
+
+jQuery(function () {
+    initModule();
+});

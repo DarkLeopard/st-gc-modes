@@ -1,0 +1,11 @@
+{
+    "display_name": "Group Chat Modes (Smart / Alias)",
+    "loading_order": 10,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "author": "Leo",
+    "version": "1.0.0",
+    "homePage": "",
+    "auto_update": false
+}
