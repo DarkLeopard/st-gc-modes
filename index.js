@@ -52,8 +52,6 @@ const UI_TEXT = {
         panelDepth: 'Context depth {n} (last messages)', panelL2: 'Level 2: indirect address (by attribute)',
         panelL3: 'Level 3: who would join the conversation', panelNote: '"Nobody" note in chat',
         panelCeiling: 'Responders cap (default)', ceilingNone: 'none',
-        aliasTitle: 'Member aliases', aliasRefresh: 'Update list',
-        columnName: 'Member', columnSignals: 'Alias words (comma separated)',
         groupCeilingLabel: 'Responders cap (this group)', groupCeilingDefault: '(default)', groupCeilingNone: 'none',
         unknownNamesToast: 'st-gc-modes: unknown name in reply: {names}',
         quietFailedToast: 'st-gc-modes: quiet request failed, skipping levels 2/3',
@@ -76,20 +74,15 @@ const UI_TEXT = {
         ttNote: 'When Smart matches nobody, push a short user message into the chat so the silence is visible.',
         ttCeiling: 'Default limit on how many members one cascade may invoke (2-5; none = unlimited).',
         ttGroupCeiling: 'Per-group responders cap; it takes priority over the default value.',
-        ttRefresh: 'Rebuild the alias table from the current character list.',
-        ttAlias: 'Alias words used instead of the name: nicknames, shortenings, forms of address. Used by both Smart and Alias modes.',
         hintInstructions: 'Read by the quiet director request in Smart mode when signals do not match.',
         hintDepth: 'Recent messages the director sees.',
         hintCeiling: 'Max members answering one user message.',
-        hintAlias: 'Aliases work in Smart and Alias modes; the character name is always checked too.',
     },
     ru: {
         panelTitle: 'Smart / Alias режимы группы', panelInstructions: 'Smart: инструкции режиссёра',
         panelDepth: 'Глубина контекста {n} (последние сообщения)', panelL2: 'Уровень 2: косвенный вызов (по признаку)',
         panelL3: 'Уровень 3: кто мог бы поддержать разговор', panelNote: 'Заметка „никто не откликнулся“ в чате',
         panelCeiling: 'Лимит отвечающих (по умолчанию)', ceilingNone: 'нет',
-        aliasTitle: 'Заменители имени (алиасы) участников', aliasRefresh: 'Обновить список',
-        columnName: 'Участник', columnSignals: 'Сигналы (через запятую)',
         groupCeilingLabel: 'Лимит отвечающих (группа)', groupCeilingDefault: '(по умолчанию)', groupCeilingNone: 'нет',
         unknownNamesToast: 'st-gc-modes: неизвестные имена в ответе: {names}',
         quietFailedToast: 'st-gc-modes: тихий запрос не удался, уровни 2/3 пропущены',
@@ -112,12 +105,9 @@ const UI_TEXT = {
         ttNote: 'Если в Smart не совпал никто, отправить в чат короткое сообщение пользователя, чтобы тишина была заметна.',
         ttCeiling: 'Сколько участников максимум может вызвать один каскад по умолчанию (2-5; «нет» = без лимита).',
         ttGroupCeiling: 'Лимит отвечающих для этой группы; приоритет выше общего значения.',
-        ttRefresh: 'Пересобрать таблицу алиасов по текущему списку персонажей.',
-        ttAlias: 'Слова-обращения вместо имени: клички, сокращения, формы обращения. Работают в режимах Smart и Alias.',
         hintInstructions: 'Их читает тихий режиссёрский запрос в режиме Smart, когда сигналы не сработали.',
         hintDepth: 'Сколько последних сообщений видит режиссёр.',
         hintCeiling: 'Максимум участников на одно сообщение пользователя.',
-        hintAlias: 'Алиасы работают в Smart и Alias; само имя персонажа проверяется всегда.',
     },
 };
 
@@ -151,7 +141,9 @@ const DEFAULT_SMART_INSTRUCTIONS = [
     'Do not pick anyone out of politeness. If several fit, list all. Answer format: participant names separated by commas, copied exactly as given in the list. If no one fits, answer exactly: none.',
 ].join('\n');
 
-// Module settings: merged one level deep from defaults on init.
+// Module settings: merged one level deep from defaults on init. aliasSignals is DEPRECATED (v1.2.0): kept only as
+// a read-only fallback for group chats saved by v1.0/v1.1; new aliases live in
+// character.data.extensions.st_gc_modes_aliases (written by the character editor field).
 const DEFAULT_SETTINGS = {
     enabled: true,            // master switch: when false, injected UI is removed and hooks stop reacting
     smart_instructions: DEFAULT_SMART_INSTRUCTIONS,
@@ -160,7 +152,7 @@ const DEFAULT_SETTINGS = {
     level3Enabled: true,      // level3 (motivation to join)
     nobodyNote: true,         // level4 "(nobody)" note in chat
     ceiling: 2,               // default responders cap: 2 | 3 | 4 | 5 | 0 (= none/unlimited)
-    aliasSignals: {},         // avatar filename -> array of signal strings (editable in panel)
+    aliasSignals: {},         // DEPRECATED (v1.2.0): kept as a read-only fallback; new aliases live in character.data.extensions.st_gc_modes_aliases
 };
 
 let settings = null;
@@ -250,7 +242,6 @@ const processedKeys = new Set(); // bounded FIFO Set of dedupe keys `${chatId}::
 let lastCascade = null;       // debug stats object of the most recent cascade run
 let injectLogged = false;     // the single one-time "options injected" debug line
 let removeLogged = false;     // the single one-time "options removed (disabled)" debug line
-let aliasPrefillLogged = false; // the single one-time "alias table prefilled" debug line
 let editorAliasesObserver = null; // the single MutationObserver switching the editor alias field between edit/create modes
 let editorAliasAnchorLogged = false; // the single one-time "editor alias block anchor missing" debug line
 let editorAliasGenerateBusy = false; // an editor alias generation request is currently in flight
@@ -317,12 +308,23 @@ function enabledMembersOf(group) {
 
 // ---- alias signals ----
 
-/** Raw alias table entry for a member: settings.aliasSignals[avatar] when it is an array, else null.
- * @param {string} avatar Avatar filename. @param {string} _name Character name (unused, kept for signature clarity).
- * @returns {string[]|null} Table signals or null when no entry exists. */
+/** Alias signals of a member: the character card (data.extensions.st_gc_modes_aliases, written by the editor
+ * field) is the source of truth — its comma string split through parseSignalList, and whenever that yields a
+ * non-empty (trimmed/deduped) list the card wins and the legacy storage is never read; otherwise the legacy
+ * per-avatar array from the v1.0/v1.1 settings storage is returned as a read-only fallback (DEPRECATED in v1.2.0,
+ * kept so existing group chats keep working). Null when neither source has anything.
+ * @param {string} avatar Avatar filename. @param {string} _name Character name (unused, kept for signature clarity:
+ * the card is keyed by character, not by name).
+ * @returns {string[]|null} Card or legacy signals, or null when no entry exists. */
 function memberSignals(avatar, _name) {
+    // 1) Character card (v1.2.0 source of truth); readCardAliases tolerates a missing character (returns '').
+    const fromCard = parseSignalList(readCardAliases(characters[findCharacterIndex(avatar)]));
+    if (fromCard.length > 0) return fromCard;
+    // 2) Legacy fallback (DEPRECATED v1.2.0): read-only per-avatar array from the v1.0/v1.1 settings storage.
     const entry = settings?.aliasSignals?.[avatar];
-    return Array.isArray(entry) ? entry : null;
+    if (Array.isArray(entry) && entry.length > 0) return entry;
+    // 3) Neither source has anything.
+    return null;
 }
 
 /** Effective signal list for level1 (direct/alias matching): the alias table entry unioned with the character's full
@@ -364,37 +366,6 @@ function memberSignalsMatch(tokenSet, signals) {
         }
     }
     return false;
-}
-
-/** Prefill signal list for a character without a table entry: [ name, first-three-letters-of-name ]; unique and
- * non-empty, users are expected to edit them (e.g. add the Cyrillic spelling).
- * @param {string} name Character name. @returns {string[]} Prefill signals. */
-function buildPrefillSignals(name) {
-    const raw = String(name ?? '').trim();
-    const stem = (raw.split(/\s+/u)[0] ?? '').slice(0, 3);
-    const out = [];
-    if (raw.length > 0) out.push(raw);
-    if (stem.length > 0 && stem.toLowerCase() !== raw.toLowerCase()) out.push(stem);
-    return out;
-}
-
-/** Prefills the alias table for enabled group members that have no entry yet; collects all additions and performs
- * a single saveSettingsDebounced() when anything was added. Called on GROUP_UPDATED / CHAT_CHANGED when the active
- * group runs Smart or Alias.
- * @param {string[]} groupMembers Enabled member avatar filenames. */
-function ensureSignalPrefill(groupMembers) {
-    let added = false;
-    for (const avatar of groupMembers) {
-        if (typeof settings.aliasSignals[avatar] !== 'undefined') continue;
-        const index = findCharacterIndex(avatar);
-        if (index === -1) continue;
-        const prefill = buildPrefillSignals(characters[index]?.name);
-        if (prefill.length > 0) {
-            settings.aliasSignals[avatar] = prefill;
-            added = true;
-        }
-    }
-    if (added) saveSettingsDebounced();
 }
 
 // ---- level 1 (direct/alias matching) ----
@@ -1217,10 +1188,10 @@ function syncGroupCeilingWidget() {
 // ---- settings panel ----
 
 /** Renders the st-gc-modes settings drawer into the extensions settings container: master switch row, repo link,
- * director instructions, context depth, the level2/level3/level4 checkboxes, the default responders cap and the
- * alias table with its toolbar. Appends the static theme-safe CSS block to the head exactly once. The static HTML
- * skeleton contains no dynamic values: every label is filled through .text() from UI_TEXT, every tooltip goes
- * through .attr('title', ...) and every dynamic value goes through .val()/.prop(). */
+ * director instructions, context depth, the level2/level3/level4 checkboxes and the default responders cap.
+ * Appends the static theme-safe CSS block to the head exactly once. The static HTML skeleton contains no dynamic
+ * values: every label is filled through .text() from UI_TEXT, every tooltip goes through .attr('title', ...) and
+ * every dynamic value goes through .val()/.prop(). */
 function renderSettingsPanel() {
     const target = $('#extensions_settings2').length > 0 ? $('#extensions_settings2') : $('#extensions_settings');
     if (target.length === 0) {
@@ -1240,18 +1211,7 @@ function renderSettingsPanel() {
             '    border: 1px solid var(--SmartThemeBorderColor);',
             '    border-radius: 5px;',
             '}',
-            '.stgcmodes #stgcmodes_alias {',
-            '    border: 1px solid var(--SmartThemeBorderColor);',
-            '    border-radius: 10px;',
-            '    max-height: 260px;',
-            '    overflow-y: auto;',
-            '    padding: 5px;',
-            '    scrollbar-color: var(--grey30) transparent;',
-            '}',
             '.stgcmodes input::placeholder { color: var(--grey30); opacity: 1; }',
-            '.stgcmodes .stgcmodes_toolbar { display: inline-flex; align-items: center; gap: 8px; flex-wrap: nowrap; white-space: nowrap; max-width: 100%; margin-top: 5px; }',
-            '.stgcmodes .stgcmodes_toolbar #stgcmodes_alias_refresh { flex: none; width: auto; white-space: nowrap; }',
-            '.stgcmodes .stgcmodes_toolbar #stgcmodes_alias_title { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }',
             '.stgcmodes .stgcmodes_hint { opacity: 0.65; font-size: 11px; margin-top: 3px; }',
             '.stgcmodes .stgcmodes_repo_row { margin: 4px 0 8px 0; font-size: 12px; }',
             '.stgcmodes .stgcmodes_repo_row a { color: var(--SmartThemeAccentColor); text-decoration: none; }',
@@ -1284,8 +1244,6 @@ function renderSettingsPanel() {
         '<select id="stgcmodes_ceiling"></select>',
         '<div class="stgcmodes_hint stgcmodes_i18n" data-key="hintCeiling"></div>',
         '</div>',
-        '<div class="stgcmodes_toolbar"><span class="stgcmodes_i18n" data-key="aliasTitle" id="stgcmodes_alias_title"></span><button id="stgcmodes_alias_refresh" class="menu_button" type="button"><span class="stgcmodes_i18n" data-key="aliasRefresh"></span></button></div><div id="stgcmodes_alias"></div>',
-        '<div class="stgcmodes_hint stgcmodes_i18n" data-key="hintAlias"></div>',
         '</div></div></div>',
     ].join('\n');
 
@@ -1308,9 +1266,6 @@ function renderSettingsPanel() {
     $('#stgcmodes_content').find('label[for="stgcmodes_note"]').attr('title', localize('ttNote'));
     $('#stgcmodes_content').find('label[for="stgcmodes_ceiling"]').attr('title', localize('ttCeiling'));
     $('#stgcmodes_ceiling').attr('title', localize('ttCeiling'));
-    $('#stgcmodes_alias_title').attr('title', localize('ttAlias'));
-    $('#stgcmodes_alias_refresh').attr('title', localize('ttRefresh'));
-    $('#stgcmodes_alias').attr('title', localize('ttAlias'));
 
     // Master switch: the checkbox reflects isEnabled(); the change handler keeps DOM and settings in sync.
     $('#stgcmodes_enabled').prop('checked', isEnabled()).on('change', function () {
@@ -1369,10 +1324,6 @@ function renderSettingsPanel() {
         saveSettingsDebounced();
         console.log(LOG_PREFIX, `default responders cap set to ${raw === '0' ? 'none (unlimited)' : raw}`);
     });
-
-    // Alias signal table: rendered now (the list is small); the box styling lives in the static CSS block.
-    renderAliasTable();
-    $('#stgcmodes_alias_refresh').on('click', renderAliasTable);
 }
 
 /** Updates the context depth label so it reads "Context depth N (last messages)" / RU equivalent. */
@@ -1380,58 +1331,6 @@ function updateDepthLabel() {
     const label = $('#stgcmodes_depth_label');
     if (label.length === 0) return;
     label.text(localize('panelDepth').replace('{n}', String(clampDepth())));
-}
-
-/** Renders the alias signals table from the current character list, sorted case-insensitively by name. Rows for
- * characters without a table entry are prefilled (name + 3-letter stem) but saved only once at the end, and only
- * when at least one entry was added; every signal input carries the localized aliasPlaceholder hint. All cell
- * content goes through .text()/.val()/.attr() — never dynamic innerHTML. */
-function renderAliasTable() {
-    const box = $('#stgcmodes_alias');
-    if (box.length === 0) return;
-    box.empty();
-
-    const list = Array.from(getContext()?.characters ?? [])
-        .filter(entry => typeof entry?.avatar === 'string' && entry.avatar.length > 0)
-        .sort((a, b) => String(a?.name ?? '').toLowerCase().localeCompare(String(b?.name ?? '').toLowerCase()));
-
-    // Column header.
-    const headerRow = $('<div>').addClass('stgcmodes_alias_row');
-    headerRow.append($('<span>').addClass('stgcmodes_alias_name').text(localize('columnName')));
-    headerRow.append($('<span>').addClass('stgcmodes_alias_cell').text(localize('columnSignals')));
-    box.append(headerRow);
-
-    let added = false;
-    for (const entry of list) {
-        const avatar = String(entry.avatar);
-        const memberName = String(entry?.name ?? avatar);
-        if (!Array.isArray(settings.aliasSignals[avatar])) {
-            const prefill = buildPrefillSignals(memberName);
-            if (prefill.length > 0) {
-                settings.aliasSignals[avatar] = prefill;
-                added = true;
-            }
-        }
-        const signals = Array.isArray(settings.aliasSignals[avatar]) ? settings.aliasSignals[avatar] : [];
-
-        const row = $('<div>').addClass('stgcmodes_alias_row');
-        const nameSpan = $('<span>').addClass('stgcmodes_alias_name').text(memberName).attr('title', memberName);
-        const input = $('<input>').attr({ type: 'text', autocomplete: 'off', spellcheck: 'false' }).addClass('stgcmodes_alias_input').val(signals.join(', ')).attr('placeholder', localize('aliasPlaceholder'));
-        $(input).on('change', function () {
-            settings.aliasSignals[avatar] = parseSignalList(String($(this).val() ?? ''));
-            saveSettingsDebounced();
-        });
-        row.append(nameSpan).append(input);
-        box.append(row);
-    }
-
-    if (added) {
-        saveSettingsDebounced();
-        if (!aliasPrefillLogged) {
-            aliasPrefillLogged = true;
-            console.log(LOG_PREFIX, 'alias table: prefilled entries for new characters');
-        }
-    }
 }
 
 // ---- debug/stats hook ----
@@ -1453,8 +1352,8 @@ function defineDebugHook() {
 // ---- init ----
 
 /** Shared handler for context events (APP_READY, CHAT_CHANGED, GROUP_UPDATED): while the master switch is off it
- * only removes previously injected DOM and skips everything else; otherwise it re-injects idempotently, syncs the
- * widgets and prefills alias signals when the active group runs one of our strategies. Never throws. */
+ * only removes previously injected DOM and skips everything else; otherwise it re-injects idempotently and syncs
+ * the widgets. Never throws. */
 function onContextEvents() {
     try {
         // The editor alias field stays injected and functional even when the master switch is off
@@ -1466,11 +1365,6 @@ function onContextEvents() {
             return;
         }
         injectStrategyOptions();
-        const group = getActiveGroup();
-        if (group) {
-            const strategy = Number(group.activation_strategy);
-            if (strategy === STRATEGY_SMART || strategy === STRATEGY_ALIAS) ensureSignalPrefill(enabledMembersOf(group));
-        }
     } catch (err) {
         console.error(LOG_PREFIX, 'context event handling failed:', err);
     }
