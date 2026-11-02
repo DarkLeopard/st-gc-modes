@@ -12,8 +12,9 @@ Aliases live in the character card itself
 (`character.data.extensions.st_gc_modes_aliases`, a single comma-separated
 string): the advanced character editor has a **Name aliases** field with a
 **Generate with LLM** button. The alias table in the extension settings panel
-is gone; groups in Smart or Alias show a warning box with a bulk
-**Fill with LLM** button that generates and saves aliases card by card.
+is gone; the group-level bulk generation is gone too (removed in v1.3.3) —
+the user generates aliases per character card, card by card, with the
+**Generate with LLM** button in the editor.
 
 ## Documentation
 

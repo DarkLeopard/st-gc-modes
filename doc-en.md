@@ -1,6 +1,6 @@
 # Group Chat Modes (Smart / Alias)
 
-**Group Chat Modes (Smart / Alias)** is a third-party UI extension for SillyTavern that adds two extra group-reply modes to group chats: **Smart** (reply strategy 4) and **Alias** (reply strategy 5). Smart picks its responders through a five-level cascade — from a direct name-or-alias hit, through a single quiet LLM request that decides who was addressed by a sign and who has a reason to join on their own, to a context auto-pick on an empty input — and posts a short note into the chat when nobody fits. Alias relies purely on the characters' aliases and never calls the LLM. This documentation covers version 1.3.1. Version 1.3.1 excludes the user's persona from all trigger and candidate levels, removes automatically the empty persona message that the ST 1.19.0 core fallback pushes on an empty send, and adds level 5 — the context auto-pick of the responder by dialogue logic on empty input.
+**Group Chat Modes (Smart / Alias)** is a third-party UI extension for SillyTavern that adds two extra group-reply modes to group chats: **Smart** (reply strategy 4) and **Alias** (reply strategy 5). Smart picks its responders through a five-level cascade — from a direct name-or-alias hit, through a single quiet LLM request that decides who was addressed by a sign and who has a reason to join on their own, to a context auto-pick on an empty input — and posts a short note into the chat when nobody fits. Alias relies purely on the characters' aliases and never calls the LLM. This documentation covers version 1.3.3. Version 1.3.1 excludes the user's persona from all trigger and candidate levels, removes automatically the empty persona message that the ST 1.19.0 core fallback pushes on an empty send, and adds level 5 — the context auto-pick of the responder by dialogue logic on empty input.
 
 ## Overview
 
@@ -39,8 +39,6 @@ The advanced character editor has a **"Name aliases"** field (RU: «Замени
 
 There is no alias table in the extension settings panel anymore. The panel keeps: the master switch, the repository link, the director instructions, the context depth, the level 2/3/4 toggles, and the default responders cap — no alias widgets.
 
-In the group panel, next to the per-group responders cap widget, a warning box appears — and only when a Smart (4) or Alias (5) group still has members without alias lists in their character cards. It carries a single line, "No aliases: <comma-separated names>", plus the **"Fill with LLM"** button: it generates aliases sequentially for every listed member, with progress toasts ("Generating aliases: 2 of 5…"); each generated list is written into that character's card and the character is saved programmatically right away; a member whose generation or save fails is skipped with its own error toast; the run ends with a summary toast. After every successful member the name leaves the list immediately, and once the list is empty the whole box disappears — no captions remain; changing the group, the chat or the membership recalculates it automatically. The button is disabled while a run is in flight. When a member's card field is empty but their aliases still live in the legacy extension storage (`aliasSignals`), the member stays in the list — the count is taken strictly from the card fields, the cascade keeps reading the legacy storage, and a fill click migrates the aliases into the card, removing the member from the legacy fallback's reach. Another click when every member already has card aliases answers with the "All members already have aliases" toast, and while a run is in flight the button shows a "Generating…" label.
-
 The resolution order is the same for Smart and Alias:
 
 - the character card field is checked first;
@@ -68,7 +66,7 @@ The panel opens under **Extensions → Group Chat Modes (Smart / Alias)**.
 6. **Level 5: context auto-pick (empty input)** — on by default. Tooltip: “When the user sends an empty message and levels 2/3 find nobody, make one extra quiet request: who must speak next according to the dialogue logic? One clearly named participant responds instead of the "(nobody)" note. The persona is never picked.”
 7. **„Nobody“ note in chat** — on by default.
 8. **Responders cap (default)** — default 2; options 2, 3, 4, 5, "none" (0).
-9. There are no alias widgets in the panel anymore: aliases are set in the advanced character editor (see "Character card aliases"), and a group's alias state is shown in the warning box in the group panel.
+9. There are no alias widgets in the panel anymore: aliases are set in the advanced character editor (see "Character card aliases").
 10. **Responders cap (this group)** — in the group panel; options "(default)", 2, 3, 4, 5, "none" — takes priority over the default.
 11. The top of the panel carries a link to the repository — <https://github.com/DarkLeopard/st-gc-modes> — captioned "Details in README".
 

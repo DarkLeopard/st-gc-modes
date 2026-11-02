@@ -67,14 +67,6 @@ const UI_TEXT = {
         charAliasEmptyToast: 'st-gc-modes: the model returned an empty alias list',
         charAliasFailedToast: 'st-gc-modes: alias generation failed',
         charAliasGenUnavailable: 'Available after the character is created and saved: aliases live in the character card.',
-        groupAliasMissing: 'No aliases: {names}',
-        groupAliasFill: 'Fill with LLM',
-        groupAliasFillTitle: 'For every member without aliases, the model reads their description and writes a generated alias list into their character card (saved immediately).',
-        bulkProgressToast: 'Generating aliases: {current} of {total}…',
-        bulkDoneToast: 'Aliases filled: {ok} of {total} members.',
-        bulkNothingToast: 'All members already have aliases',
-        bulkBusyLabel: 'Generating…',
-        bulkMemberFailedToast: 'st-gc-modes: aliases for {name} failed — skipped',
         toggleOffToast: 'st-gc-modes disabled: Smart/Alias options hidden', toggleOnToast: 'st-gc-modes enabled',
         ttEnabled: 'Master switch. When off, the extension removes its Smart/Alias options and the per-group cap widget and stops reacting to messages; the panel itself stays available.',
         ttInstructions: 'System instructions for the quiet "director" LLM request used by Smart mode when no direct alias match. The model reads the participant list and the recent chat.',
@@ -109,14 +101,6 @@ const UI_TEXT = {
         charAliasEmptyToast: 'st-gc-modes: модель вернула пустой список алиасов',
         charAliasFailedToast: 'st-gc-modes: генерация алиасов не удалась',
         charAliasGenUnavailable: 'Доступно после создания и сохранения персонажа: алиасы живут в его карточке.',
-        groupAliasMissing: 'Без алиасов: {names}',
-        groupAliasFill: 'Заполнить через LLM',
-        groupAliasFillTitle: 'Для каждого участника без алиасов модель читает его описание и записывает сгенерированный список алиасов в его карточку (сразу сохраняет).',
-        bulkProgressToast: 'Генерирую алиасы: {current} из {total}…',
-        bulkDoneToast: 'Алиасы заполнены: {ok} из {total} участников.',
-        bulkNothingToast: 'Алиасы уже заданы у всех участников',
-        bulkBusyLabel: 'Генерирую…',
-        bulkMemberFailedToast: 'st-gc-modes: не удалось для {name} — пропущен',
         toggleOffToast: 'st-gc-modes выключен: пункты Smart/Alias скрыты', toggleOnToast: 'st-gc-modes включён',
         ttEnabled: 'Главный выключатель. Когда выключено, расширение убирает свои пункты Smart/Alias и виджет лимита группы и перестаёт реагировать на сообщения; сама панель остаётся доступной.',
         ttInstructions: 'Системные инструкции тихого «режиссёрского» запроса к LLM в режиме Smart, когда прямого совпадения по алиасам нет. Модель читает список участников и последние сообщения.',
@@ -271,7 +255,6 @@ let editorAliasesObserver = null; // the single MutationObserver switching the e
 let editorSubmitSyncBound = false; // the document-capture submit preprocessor was bound once (see bindEditorSubmitSync)
 let editorAliasAnchorLogged = false; // the single one-time "editor alias block anchor missing" debug line
 let editorAliasGenerateBusy = false; // an editor alias generation request is currently in flight
-let bulkAliasFillBusy = false; // a bulk "Fill with LLM" run over the group alias widget is currently in flight
 const cascadeStats = { messagesSeen: 0, cascadesRun: 0, level1Hits: 0, quietCalls: 0, level5Calls: 0, level5Hits: 0, generationsPushed: 0, notes: 0, personaEmptyRemoved: 0 };
 
 // ---- group helpers ----
@@ -354,14 +337,6 @@ function memberSignals(avatar, _name) {
     return null;
 }
 
-/** Whether the member's CHARACTER CARD already carries aliases — strictly per card (data.extensions.st_gc_modes_aliases
- * split through parseSignalList); the legacy settings storage is ignored. Used for the alias-warning "without aliases"
- * count and the bulk fill targets, so a legacy-only member stays in the pool and gets migrated by a bulk click.
- * @param {string} avatar Avatar filename. @returns {boolean} True when the card yields at least one signal. */
-function cardHasAliases(avatar) {
-    return parseSignalList(readCardAliases(characters[findCharacterIndex(avatar)])).length > 0;
-}
-
 /** Whether a member resolves usable alias signals from either source (card or legacy): memberSignals folds the
  * card-first source and the legacy fallback into one call, so a non-empty result is enough. The CASCADE keeps
  * using this call — a legacy-only member keeps matching in live chats.
@@ -369,16 +344,6 @@ function cardHasAliases(avatar) {
 function memberHasAliases(avatar) {
     const signals = memberSignals(avatar, '');
     return Array.isArray(signals) && signals.length > 0;
-}
-
-/** Enabled members of the group whose CARD field has no aliases (legacy storage deliberately ignored, see
- * cardHasAliases), in enabledMembersOf order; members whose character no longer exists are skipped silently
- * (nothing can generate for them). Drives the alias-warning list and the bulk fill targets: the warning box names
- * exactly this list, and a bulk fill migrates legacy-only members too — after the generated card aliases save, the
- * card wins and the legacy storage is never read again for that member.
- * @param {object|null} group Active group object (may be null). @returns {string[]} Avatar filenames without card aliases. */
-function membersWithoutAliases(group) {
-    return enabledMembersOf(group).filter(avatar => findCharacterIndex(avatar) !== -1 && !cardHasAliases(avatar));
 }
 
 /** Effective signal list for level1 (direct/alias matching): the alias table entry unioned with the character's full
@@ -661,9 +626,9 @@ async function contextLevelRequest(memberList) {
     return null;
 }
 
-// ---- character-card aliases (editor + bulk fill) ----
+// ---- character-card aliases (editor) ----
 
-// Shared instruction block for the quiet alias-generation request (editor generate button; reused by the bulk fill later).
+// Shared instruction block for the quiet alias-generation request (editor generate button).
 const ALIASES_PROMPT_INSTRUCTIONS = [
     'Read the character description below.',
     'Produce a list of name aliases: forms of address, shortenings, nicknames, diminutives,',
@@ -871,8 +836,8 @@ function setHiddenExtensions(aliasString) {
  * with an explanatory title.
  * This is the FULL sync, so its call sites are deliberately limited to the moments the mode itself flips or the card
  * behind the form was swapped: the MutationObserver callback, onCharacterEditorOpened and the initial sync at the end
- * of ensureEditorAliasesField. Everywhere else use the half-syncs: syncEditorAliasesButtonState (button + carrier
- * name attribute only) and refreshEditorAliasesFromCard (field + carrier populated from the card only). */
+ * of ensureEditorAliasesField. Everywhere else use the half-sync: syncEditorAliasesButtonState (button + carrier
+ * name attribute only). */
 function syncEditorAliasesMode() {
     const field = $('#stgcmodes_char_aliases');
     const genButton = $('#stgcmodes_char_alias_gen');
@@ -891,29 +856,6 @@ function syncEditorAliasesMode() {
         setHiddenExtensions(''); // defensive: the name attribute is removed here, but a stale carrier value must not linger
         genButton.prop('disabled', true);
         genButton.attr('title', localize('charAliasGenUnavailable'));
-    }
-}
-
-/** Population half of the mode sync: re-reads ONLY the aliases stored in the card behind the open editor form into
- * the visible field (written only when the value differs, so no caret jumps) and re-initializes the hidden carrier
- * from them via setHiddenExtensions (an untouched save re-submits the stored list instead of an empty string).
- * Used ONLY for genuine card changes — e.g. a member freshly saved from the bulk fill that is open in the editor at
- * that very moment; it no-ops outside edit mode ("nothing to populate") and, when an expected chid is passed,
- * whenever the editor is open on a different member. Never touches the generate button; for mere button/state
- * updates use syncEditorAliasesButtonState instead.
- * @param {number} [expectedChid] Index into characters the editor must currently work on for the refresh to apply. */
-function refreshEditorAliasesFromCard(expectedChid) {
-    try {
-        const field = $('#stgcmodes_char_aliases');
-        if ($('#form_create').attr('actiontype') !== 'editcharacter') return; // nothing to populate in create mode
-        const chid = getEditorChid();
-        if (expectedChid !== undefined && expectedChid !== chid) return; // editor is open on a different member
-        const card = Number.isInteger(chid) ? characters[chid] : null;
-        const aliases = readCardAliases(card);
-        if (field.length > 0 && String(field.val() ?? '') !== aliases) field.val(aliases);
-        setHiddenExtensions(aliases);
-    } catch (err) {
-        console.error(LOG_PREFIX, 'editor alias card refresh failed:', err);
     }
 }
 
@@ -1551,8 +1493,8 @@ async function invokeMember(chid) {
 // ---- injection (strategy options + per-group ceiling widget) ----
 
 /** Idempotently injects the Smart/Alias options into the group reply strategy select, installs the per-group
- * responders-cap widget and the group alias warning widget right after the strategy select's flex container, and
- * syncs all injected widgets. When the master switch is off, it removes
+ * responders-cap widget right after the strategy select's flex container, and syncs all injected widgets. When the
+ * master switch is off, it removes
  * the previously injected DOM instead of injecting. Runs cheaply on every context hook and retries automatically
  * when the DOM is not ready yet; never throws. */
 function injectStrategyOptions() {
@@ -1570,10 +1512,8 @@ function injectStrategyOptions() {
             injected = true;
         }
         injected = injectCeilingWidget(select) || injected;
-        injected = injectAliasWarning(select) || injected;
         syncStrategySelect();
         syncGroupCeilingWidget();
-        syncGroupAliasWarning();
         if (injected && !injectLogged) {
             injectLogged = true;
             removeLogged = false; // the next removal may log its one line again
@@ -1584,14 +1524,13 @@ function injectStrategyOptions() {
     }
 }
 
-/** Removes the injected Smart/Alias options, the per-group responders-cap widget and the group alias warning
- * widget from the DOM; used whenever the master switch is off (context hooks and the panel toggle). Idempotent and
- * wrapped in try/catch: never throws. Resets the one-time injection log flag so re-enabling logs the next injection again. */
+/** Removes the injected Smart/Alias options and the per-group responders-cap widget from the DOM; used whenever the
+ * master switch is off (context hooks and the panel toggle). Idempotent and wrapped in try/catch: never throws.
+ * Resets the one-time injection log flag so re-enabling logs the next injection again. */
 function removeInjected() {
     try {
         $('#rm_group_activation_strategy').find('option[value="4"],option[value="5"]').remove();
         $('#stgcmodes_group_ceiling_wrap').remove();
-        $('#stgcmodes_group_aliaswarn').remove();
         injectLogged = false; // a re-enable must log the injection again
         if (!removeLogged) {
             removeLogged = true;
@@ -1669,160 +1608,6 @@ function syncGroupCeilingWidget() {
     if (valueSelect.val() !== value) valueSelect.val(value);
 }
 
-// ---- group alias warning widget ----
-
-/** Creates and mounts the group alias warning widget once, right after the per-group ceiling widget when present,
- * else after the strategy select's own flex container: a single line naming the members without card aliases and
- * the bulk "Fill with LLM" button. The widget is only shown and filled by syncGroupAliasWarning when that list is
- * non-empty. Idempotent; returns false
- * when the anchor layout differs (retried on the next context hook). All texts go through .text()/.attr('title').
- * @param {JQuery} strategySelect The #rm_group_activation_strategy element. @returns {boolean} True when the widget was created by this call. */
-function injectAliasWarning(strategySelect) {
-    if ($('#stgcmodes_group_aliaswarn').length > 0) return false;
-    const anchor = strategySelect.closest('div.flex1');
-    if (anchor.length === 0) return false; // Anchor layout differs; retried on the next context hook.
-    const widget = $('<div>').attr('id', 'stgcmodes_group_aliaswarn').addClass('flex1');
-    $('<div>').attr('id', 'stgcmodes_group_aliaswarn_missing').append($('<span>')).appendTo(widget);
-    const fillButton = $('<div>').attr({ id: 'stgcmodes_group_aliaswarn_fill', title: localize('groupAliasFillTitle') }).addClass('menu_button');
-    fillButton.append($('<i>').addClass('fa-solid fa-wand-magic-sparkles'));
-    fillButton.append($('<span>').text(localize('groupAliasFill')));
-    fillButton.on('click', onBulkAliasFill);
-    widget.append(fillButton);
-    const ceilingWrap = $('#stgcmodes_group_ceiling_wrap');
-    if (ceilingWrap.length > 0) ceilingWrap.after(widget); else anchor.after(widget);
-    return true;
-}
-
-/** Refreshes the group alias warning widget for the open group: the widget exists (is visible) only while an active
- * group uses the Smart or Alias strategy AND the list of enabled members without card aliases is non-empty
- * (cardHasAliases semantics, legacy storage deliberately ignored). The line names those members (sanitized exactly
- * like the cascade unknown-name toast, replaced through a function argument against HTML-special characters). In
- * every other state — no group, foreign strategy, empty group, every member already has card aliases — the line
- * text is cleared and the widget is hidden, so no caption ever remains; the bulk button is disabled while there is
- * nothing to fill or a bulk run is in flight (set before the early return so the run's own rerenders keep honoring
- * it). Called from injectStrategyOptions right after syncGroupCeilingWidget (so it reruns on every context hook —
- * group, chat and membership changes), from onBulkAliasFill after EVERY successful member (incremental rerender:
- * the filled member leaves the list, the last one hides the widget entirely) and again in the bulk fill finally. */
-function syncGroupAliasWarning() {
-    const widget = $('#stgcmodes_group_aliaswarn');
-    if (widget.length === 0) return;
-    const group = getActiveGroup();
-    const strategy = Number(group?.activation_strategy);
-    const missing = (group && (strategy === STRATEGY_SMART || strategy === STRATEGY_ALIAS))
-        ? membersWithoutAliases(group)
-        : [];
-    $('#stgcmodes_group_aliaswarn_fill').prop('disabled', missing.length === 0 || isBulkAliasFillRunning());
-    if (missing.length === 0) {
-        $('#stgcmodes_group_aliaswarn_missing span').text(''); // no caption left in any settled state
-        widget.hide();
-        return;
-    }
-    widget.show();
-    // toastr renders the message as HTML: strip HTML-special characters from every member name before the join.
-    const safeNames = missing.map(avatarToName).map(name => String(name).replace(/[<>&"'\u0060]/g, '')).join(', ');
-    $('#stgcmodes_group_aliaswarn_missing span').text(localize('groupAliasMissing').replace('{names}', () => safeNames));
-}
-
-// ---- group alias bulk fill ----
-
-/** Whether a bulk "Fill with LLM" run is currently in flight; keeps re-entrants out and the widget button disabled.
- * @returns {boolean} True while onBulkAliasFill is running. */
-function isBulkAliasFillRunning() {
-    return bulkAliasFillBusy;
-}
-
-/** Per-member failure toast of the bulk fill: the localized bulkMemberFailedToast with {name} replaced by the
- * sanitized member name (HTML-special characters stripped, function-argument replace like the unknown-names toast).
- * @param {string} name Member display name (may be undefined). @returns {void} Nothing. */
-function showBulkMemberFailedToast(name) {
-    if (typeof toastr !== 'undefined' && typeof toastr.error === 'function') {
-        toastr.error(localize('bulkMemberFailedToast').replace('{name}', () => String(name ?? '').replace(/[<>&"'\u0060]/g, '')), MODULE_NAME);
-    }
-}
-
-/** Click handler for the group alias widget's "Fill with LLM" button: for every enabled member of the active group
- * that still has no CARD aliases (existing character only; legacy-only members qualify — the fill migrates them),
- * one quiet generateRaw request over buildAliasPrompt, parsed by parseAliasAnswer and saved straight into the
- * character card through saveCharacterAliases (programmatic FULL form save + in-place single-character refresh).
- * Members run strictly sequentially like the invokeMembers loop; every per-member failure is a toast + skip (never a
- * throw out of the loop) and the run always ends with the bulkDoneToast; a zero-target run answers with the
- * bulkNothingToast and never starts; after EVERY successful member syncGroupAliasWarning reruns the "no aliases"
- * list incrementally (the widget hides itself once the last member is filled); while the run is in flight the
- * button label switches to bulkBusyLabel (the original caption is restored in finally together with the busy flag
- * and the button state).
- * @returns {Promise<void>} Resolves once the run finished. */
-async function onBulkAliasFill() {
-    if (!isEnabled() || bulkAliasFillBusy) return;
-    const group = getActiveGroup();
-    if (!group) {
-        console.warn(LOG_PREFIX, 'bulk alias fill skipped: no active group');
-        return;
-    }
-    const strategy = Number(group.activation_strategy);
-    if (strategy !== STRATEGY_SMART && strategy !== STRATEGY_ALIAS) return;
-    const targets = membersWithoutAliases(group);
-    if (targets.length === 0) {
-        console.warn(LOG_PREFIX, 'bulk alias fill skipped: all members already have card aliases');
-        if (typeof toastr !== 'undefined' && typeof toastr.info === 'function') {
-            toastr.info(localize('bulkNothingToast'), MODULE_NAME);
-        }
-        return;
-    }
-    bulkAliasFillBusy = true;
-    const fillLabel = $('#stgcmodes_group_aliaswarn_fill span').first();
-    const originalLabel = String(fillLabel.text() ?? '');
-    try {
-        $('#stgcmodes_group_aliaswarn_fill').prop('disabled', true); // queried by id each time: the widget can be re-injected
-        fillLabel.text(localize('bulkBusyLabel'));
-        let ok = 0;
-        for (let i = 0; i < targets.length; i++) {
-            const avatar = targets[i];
-            const chid = findCharacterIndex(avatar);
-            if (chid === -1) continue;
-            // Progress toast once per member, both numbers replaced through function arguments.
-            if (typeof toastr !== 'undefined' && typeof toastr.info === 'function') {
-                toastr.info(localize('bulkProgressToast').replace('{current}', () => String(i + 1)).replace('{total}', () => String(targets.length)), MODULE_NAME);
-            }
-            const ch = characters[chid];
-            const prompt = buildAliasPrompt(ch);
-            if (prompt === null) {
-                showBulkMemberFailedToast(ch?.name);
-                continue;
-            }
-            let answer = '';
-            try {
-                answer = await generateRaw({ prompt, systemPrompt: '' });
-            } catch (err) {
-                console.error(LOG_PREFIX, `bulk alias generation for ${String(ch?.name ?? avatar)} failed:`, err);
-                showBulkMemberFailedToast(ch?.name);
-                continue;
-            }
-            const aliases = parseAliasAnswer(answer, ch?.name);
-            if (aliases.length === 0) {
-                showBulkMemberFailedToast(ch?.name);
-                continue;
-            }
-            const aliasString = aliases.join(', ');
-            const saved = await saveCharacterAliases(chid, aliasString);
-            if (!saved) {
-                showBulkMemberFailedToast(ch?.name);
-                continue;
-            }
-            ok += 1;
-            console.log(LOG_PREFIX, 'bulk aliases written:', ch.name, '->', aliases.length, 'items');
-            refreshEditorAliasesFromCard(chid); // the character is open in the editor: re-read the freshly saved card into the form
-            syncGroupAliasWarning(); // incremental rerender: this member leaves the "no aliases" list right away
-        }
-        if (typeof toastr !== 'undefined' && typeof toastr.info === 'function') {
-            toastr.info(localize('bulkDoneToast').replace('{ok}', () => String(ok)).replace('{total}', () => String(targets.length)), MODULE_NAME);
-        }
-    } finally {
-        $('#stgcmodes_group_aliaswarn_fill span').first().text(originalLabel); // busy label back to the original caption
-        bulkAliasFillBusy = false;
-        syncGroupAliasWarning(); // recomputes the missing list (now possibly empty) and the button disabled state
-    }
-}
-
 // ---- settings panel ----
 
 /** Renders the st-gc-modes settings drawer into the extensions settings container: master switch row, repo link,
@@ -1849,8 +1634,6 @@ function renderSettingsPanel() {
             '    border: 1px solid var(--SmartThemeBorderColor);',
             '    border-radius: 5px;',
             '}',
-            '/* group alias warning widget */',
-            '#stgcmodes_group_aliaswarn { border: 1px solid var(--SmartThemeBorderColor); border-radius: 10px; background-color: var(--black30a); padding: 5px 8px; margin-top: 5px; display: none; }',
             '.stgcmodes input::placeholder { color: var(--grey30); opacity: 1; }',
             '.stgcmodes .stgcmodes_hint { opacity: 0.65; font-size: 11px; margin-top: 3px; }',
             '.stgcmodes .stgcmodes_repo_row { margin: 4px 0 8px 0; font-size: 12px; }',
