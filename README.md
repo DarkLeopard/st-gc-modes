@@ -1,10 +1,12 @@
 # Group Chat Modes (Smart / Alias)
 
 A SillyTavern third-party extension that adds two extra group reply modes to
-group chats: **Smart** and **Alias**. Smart runs a four-level cascade — direct
+group chats: **Smart** and **Alias**. Smart runs a five-level cascade — direct
 alias matching first, then one quiet "director" LLM request — and posts a
-"(nobody)" note when no one fits. Alias is pure alias-signal matching with no
-LLM calls at all.
+"(nobody)" note when no one fits; when the user sends an empty message and the
+dialogue logic has a clear next speaker, level 5 makes that participant
+respond — while the user's persona can never be chosen. Alias is pure
+alias-signal matching with no LLM calls at all.
 
 Aliases live in the character card itself
 (`character.data.extensions.st_gc_modes_aliases`, a single comma-separated

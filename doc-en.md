@@ -1,6 +1,6 @@
 # Group Chat Modes (Smart / Alias)
 
-**Group Chat Modes (Smart / Alias)** is a third-party UI extension for SillyTavern that adds two extra group-reply modes to group chats: **Smart** (reply strategy 4) and **Alias** (reply strategy 5). Smart picks its responders through a four-level cascade — from a direct name-or-alias hit to a single quiet LLM request that decides who was addressed by a sign and who has a reason to join on their own — and posts a short note into the chat when nobody fits. Alias relies purely on the characters' aliases and never calls the LLM. This documentation covers version 1.2.3.
+**Group Chat Modes (Smart / Alias)** is a third-party UI extension for SillyTavern that adds two extra group-reply modes to group chats: **Smart** (reply strategy 4) and **Alias** (reply strategy 5). Smart picks its responders through a five-level cascade — from a direct name-or-alias hit, through a single quiet LLM request that decides who was addressed by a sign and who has a reason to join on their own, to a context auto-pick on an empty input — and posts a short note into the chat when nobody fits. Alias relies purely on the characters' aliases and never calls the LLM. This documentation covers version 1.3.1. Version 1.3.1 excludes the user's persona from all trigger and candidate levels, removes automatically the empty persona message that the ST 1.19.0 core fallback pushes on an empty send, and adds level 5 — the context auto-pick of the responder by dialogue logic on empty input.
 
 ## Overview
 
@@ -17,9 +17,10 @@ The extension does not patch the SillyTavern core. It adds two options — **Sma
 - **Level 1: direct hit (name or alias)** — local matching of the message against the character aliases: the character name always counts, plus the signals. If members are found, they answer immediately and the cascade stops. No LLM call.
 - **Level 2: indirect address (by attribute)** — when no direct match exists, the quiet LLM request asks who was addressed by a sign — a profession, a role, a look ("Hey, baker!") — instead of the name.
 - **Level 3: who would join the conversation** — the same single request also asks who has their own reason to support the conversation right now, even if nobody addressed them directly.
+- **Level 5: context auto-pick (empty input)** — Smart-only, and only for an empty input. When the cascade reaches the "nobody" point (levels 2/3 found no one in the quiet request), one extra quiet request asks: "who must speak next according to the dialogue logic?" — unfinished expectations, unanswered question-answer pairs, whose turn is due. The answer must be exactly one participant name, resolved strictly against the roster (an exact name-or-alias match, no fuzzy matching): a single clear pick has that participant respond instead of the "Nobody" note; any other outcome keeps the current behavior. The level has its own checkbox in the panel, on by default; the persona is never picked.
 - **„Nobody“ note in chat** — when Smart matched nobody, the extension pushes a short user message into the chat: `(Nobody joined the conversation.)` (in a Russian UI — `(Никто не вступил в разговор.)`); one `localize()` call picks the language. No LLM call.
 
-The LLM is reached only for levels 2 and 3, and only once: a single quiet `generateRaw` request to the currently active API — no preset is touched. Levels 1 and 4 are local, and Alias mode never calls the LLM at all. If the quiet request fails or returns an empty answer, that counts as "nobody": levels 2 and 3 are simply skipped and no exception is raised.
+The LLM is reached only for quiet requests: levels 2 and 3 share a single quiet `generateRaw` request to the currently active API — no preset is touched — and level 5 makes one more quiet request, only on an empty input. Levels 1 and 4 are local, and Alias mode never calls the LLM at all. If the quiet request fails or returns an empty answer, that counts as "nobody": levels 2 and 3 are simply skipped and no exception is raised. A failed or empty level 5 request counts as "no clear pick".
 
 ## Responders cap (the ceiling)
 
@@ -64,11 +65,12 @@ The panel opens under **Extensions → Group Chat Modes (Smart / Alias)**.
 3. **Context depth N (last messages)** — default 10, range 1–50. Tooltip: “How many of the last chat messages the director request sees (1-50).”
 4. **Level 2: indirect address (by attribute)** — on by default.
 5. **Level 3: who would join the conversation** — on by default.
-6. **„Nobody“ note in chat** — on by default.
-7. **Responders cap (default)** — default 2; options 2, 3, 4, 5, "none" (0).
-8. There are no alias widgets in the panel anymore: aliases are set in the advanced character editor (see "Character card aliases"), and a group's alias state is shown in the warning box in the group panel.
-9. **Responders cap (this group)** — in the group panel; options "(default)", 2, 3, 4, 5, "none" — takes priority over the default.
-10. The top of the panel carries a link to the repository — <https://github.com/DarkLeopard/st-gc-modes> — captioned "Details in README".
+6. **Level 5: context auto-pick (empty input)** — on by default. Tooltip: “When the user sends an empty message and levels 2/3 find nobody, make one extra quiet request: who must speak next according to the dialogue logic? One clearly named participant responds instead of the "(nobody)" note. The persona is never picked.”
+7. **„Nobody“ note in chat** — on by default.
+8. **Responders cap (default)** — default 2; options 2, 3, 4, 5, "none" (0).
+9. There are no alias widgets in the panel anymore: aliases are set in the advanced character editor (see "Character card aliases"), and a group's alias state is shown in the warning box in the group panel.
+10. **Responders cap (this group)** — in the group panel; options "(default)", 2, 3, 4, 5, "none" — takes priority over the default.
+11. The top of the panel carries a link to the repository — <https://github.com/DarkLeopard/st-gc-modes> — captioned "Details in README".
 
 The default text of the director instructions (from `DEFAULT_SMART_INSTRUCTIONS` in index.js):
 
@@ -87,6 +89,8 @@ Do not pick anyone out of politeness. If several fit, list all. Answer format: p
 - The "(nobody)" note is an ordinary user message, so later LLM requests see it in the chat context.
 - Repeated triggers on the same message are filtered out: events are deduplicated by chat + message index + send date.
 - The cascade starts slightly deferred (50 ms) and waits for the group to be idle.
+
+Empty sends are a special case. In SillyTavern 1.19.0, a Smart (4) or Alias (5) group with an empty input box falls back to the core behavior "send the user message as is": an empty message named after the user's persona lands in the chat. The extension removes it immediately upon render. In Smart this counts as a continue signal, and the cascade runs with an empty input: when the dialogue logic has a clear next speaker, that participant responds (level 5); when there is no clear continuation, everything follows the usual rules — up to and including the "(nobody)" note. In Alias there are no signals and nothing happens. The persona is never chosen to answer at any level, and its own messages are left untouched.
 
 ## Limitations and known quirks
 
