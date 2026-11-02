@@ -536,8 +536,8 @@ const ALIASES_PROMPT_INSTRUCTIONS = [
 function buildAliasPrompt(ch) {
     let text = collapseWhitespace(ch?.data?.description);
     if (text.length === 0) {
-        const personality = collapseWhitespace(ch?.personality ?? ch?.data?.personality);
-        const scenario = collapseWhitespace(ch?.scenario ?? ch?.data?.scenario);
+        const personality = collapseWhitespace(ch?.data?.personality ?? ch?.personality);
+        const scenario = collapseWhitespace(ch?.data?.scenario ?? ch?.scenario);
         text = [personality, scenario].filter(part => part.length > 0).join(': ');
     }
     if (text.length === 0) return null;
@@ -685,11 +685,13 @@ function syncEditorAliasesMode() {
         const card = Number.isInteger(chid) ? characters[chid] : null;
         const aliases = readCardAliases(card);
         if (field.length > 0 && String(field.val() ?? '') !== aliases) field.val(aliases);
+        setHiddenExtensions(aliases); // re-init the hidden carrier from the card: an untouched save re-submits the stored list instead of an empty string
         genButton.prop('disabled', !isEnabled());
         genButton.attr('title', localize('charAliasGenTitle'));
     } else {
         $('#stgcmodes_char_extensions').removeAttr('name');
         if (field.length > 0 && String(field.val() ?? '') !== '') field.val('');
+        setHiddenExtensions(''); // defensive: the name attribute is removed here, but a stale carrier value must not linger
         genButton.prop('disabled', true);
         genButton.attr('title', localize('charAliasGenUnavailable'));
     }
@@ -705,6 +707,7 @@ async function onEditorAliasGenerate() {
     if ($('#form_create').attr('actiontype') !== 'editcharacter') return; // Button is disabled in create mode anyway.
     if (editorAliasGenerateBusy) return;
     const chid = getEditorChid();
+    const capturedChid = chid;
     const ch = Number.isInteger(chid) ? characters[chid] : null;
     if (!ch) {
         if (typeof toastr !== 'undefined' && typeof toastr.error === 'function') toastr.error(localize('charAliasFailedToast'), MODULE_NAME);
@@ -734,11 +737,16 @@ async function onEditorAliasGenerate() {
             if (typeof toastr !== 'undefined' && typeof toastr.info === 'function') toastr.info(localize('charAliasEmptyToast'), MODULE_NAME);
             return;
         }
+        if (getEditorChid() !== capturedChid) {
+            // The user switched editor targets mid-flight: discard the answer without touching any field.
+            console.log(LOG_PREFIX, 'editor alias generation discarded: editor target changed');
+            return;
+        }
         $('#stgcmodes_char_aliases').val(aliases.join(', ')).trigger('change');
         console.log(LOG_PREFIX, `editor aliases generated: ${aliases.length} items`);
     } finally {
         editorAliasGenerateBusy = false;
-        $('#stgcmodes_char_alias_gen').prop('disabled', false); // restore in finally, per handler contract
+        syncEditorAliasesMode(); // restore in finally, per handler contract: re-states the button disabled/title per the current mode and master switch
     }
 }
 
