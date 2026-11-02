@@ -545,8 +545,9 @@ function buildAliasPrompt(ch) {
 }
 
 /** Parses a raw alias-generation answer into a clean list: split on commas/semicolons/newlines/pipes, trim, drop
- * empties, drop duplicates case-insensitively (same dedupe approach as parseSignalList), drop any item equal to the
- * character name case-insensitively, cap at 8 items.
+ * empties, drop duplicates case-insensitively (parseSignalList dedupes case-sensitively; this parser is stricter),
+ * drop any item equal to the
+ * character name case-insensitively, cap at 8 items (a stricter, case-insensitive variant of parseSignalList).
  * @param {string} answer Raw model answer. @param {string} name Character full name to exclude.
  * @returns {string[]} Up to 8 cleaned alias strings, original order. */
 function parseAliasAnswer(answer, name) {
@@ -576,6 +577,7 @@ function readCardAliases(ch) {
  * @returns {number|null} Index into characters, or null outside edit mode / without a valid id. */
 function getEditorChid() {
     if ($('#form_create').attr('actiontype') !== 'editcharacter') return null;
+    if (this_chid === null || typeof this_chid === 'undefined') return null; // Number(null) would lie as 0
     const chid = Number(this_chid);
     return Number.isInteger(chid) ? chid : null;
 }
