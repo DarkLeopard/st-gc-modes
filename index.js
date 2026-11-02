@@ -68,6 +68,7 @@ const UI_TEXT = {
         groupAliasWarning: 'Character aliases from the character card fields are used.',
         groupAliasMissing: 'No aliases: {names}',
         groupAliasAllSet: 'All members have aliases.',
+        groupAliasLegacy: 'Aliases for {names} come from the legacy plugin storage',
         groupAliasFill: 'Fill with LLM',
         groupAliasFillTitle: 'For every member without aliases, the model reads their description and writes a generated alias list into their character card (saved immediately).',
         bulkProgressToast: 'Generating aliases: {current} of {total}…',
@@ -107,6 +108,7 @@ const UI_TEXT = {
         groupAliasWarning: 'Используются алиасы из полей персонажей.',
         groupAliasMissing: 'Без алиасов: {names}',
         groupAliasAllSet: 'Все участники имеют алиасы.',
+        groupAliasLegacy: 'Алиасы для {names} берутся из прежнего хранилища плагина',
         groupAliasFill: 'Заполнить через LLM',
         groupAliasFillTitle: 'Для каждого участника без алиасов модель читает его описание и записывает сгенерированный список алиасов в его карточку (сразу сохраняет).',
         bulkProgressToast: 'Генерирую алиасы: {current} из {total}…',
@@ -1391,6 +1393,7 @@ function injectAliasWarning(strategySelect) {
     const widget = $('<div>').attr('id', 'stgcmodes_group_aliaswarn').addClass('flex1');
     $('<div>').attr('id', 'stgcmodes_group_aliaswarn_text').append($('<span>')).appendTo(widget);
     $('<div>').attr('id', 'stgcmodes_group_aliaswarn_missing').append($('<span>')).appendTo(widget);
+    $('<div>').attr('id', 'stgcmodes_group_aliaswarn_legacy').attr('style', 'display:none').append($('<span>')).appendTo(widget);
     const fillButton = $('<div>').attr({ id: 'stgcmodes_group_aliaswarn_fill', title: localize('groupAliasFillTitle') }).addClass('menu_button');
     fillButton.append($('<i>').addClass('fa-solid fa-wand-magic-sparkles'));
     fillButton.append($('<span>').text(localize('groupAliasFill')));
@@ -1404,7 +1407,9 @@ function injectAliasWarning(strategySelect) {
 /** Refreshes the group alias warning widget for the open group: hidden unless an active group uses the Smart or
  * Alias strategy, the first line always shows the groupAliasWarning text, the second line shows either
  * groupAliasAllSet or the groupAliasMissing list (member names sanitized exactly like the cascade unknown-name
- * toast, replaced through a function argument against HTML-special characters) and the bulk button is disabled
+ * toast, replaced through a function argument against HTML-special characters), an optional third line shows the
+ * members whose card field is empty but whose aliases still come from the legacy settings storage
+ * (groupAliasLegacy, hidden while the list is empty) and the bulk button is disabled
  * when there is nothing to fill or a bulk run is in flight. Called from injectStrategyOptions right after
  * syncGroupCeilingWidget (so it reruns on every context hook) and again in the bulk fill finally block. */
 function syncGroupAliasWarning() {
@@ -1424,6 +1429,10 @@ function syncGroupAliasWarning() {
     $('#stgcmodes_group_aliaswarn_missing span').text(missing.length === 0
         ? localize('groupAliasAllSet')
         : localize('groupAliasMissing').replace('{names}', () => safeNames));
+    const legacyOnly = membersWithLegacyOnlyAliases(group);
+    const safeLegacyNames = legacyOnly.map(avatarToName).map(name => String(name).replace(/[<>&"'\u0060]/g, '')).join(', ');
+    $('#stgcmodes_group_aliaswarn_legacy span').text(localize('groupAliasLegacy').replace('{names}', () => safeLegacyNames));
+    $('#stgcmodes_group_aliaswarn_legacy').toggle(legacyOnly.length > 0);
     $('#stgcmodes_group_aliaswarn_fill').prop('disabled', missing.length === 0 || isBulkAliasFillRunning());
 }
 
@@ -1541,6 +1550,7 @@ function renderSettingsPanel() {
             '}',
             '/* group alias warning widget */',
             '#stgcmodes_group_aliaswarn { border: 1px solid var(--SmartThemeBorderColor); border-radius: 10px; background-color: var(--black30a); padding: 5px 8px; margin-top: 5px; display: none; }',
+            '#stgcmodes_group_aliaswarn_legacy { opacity: 0.65; font-size: 11px; margin-top: 3px; }',
             '.stgcmodes input::placeholder { color: var(--grey30); opacity: 1; }',
             '.stgcmodes .stgcmodes_hint { opacity: 0.65; font-size: 11px; margin-top: 3px; }',
             '.stgcmodes .stgcmodes_repo_row { margin: 4px 0 8px 0; font-size: 12px; }',
