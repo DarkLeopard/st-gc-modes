@@ -1534,7 +1534,7 @@ function renderSettingsPanel() {
 
     const skeleton = [
         '<div class="stgcmodes"><div class="inline-drawer">',
-        '<div class="inline-drawer-toggle inline-drawer-header"><b><span class="stgcmodes_i18n" data-key="panelTitle"></span></b><div class="inline-drawer-icon fa-solid fa-chevron-down expander"></div></div>',
+        '<div class="inline-drawer-toggle inline-drawer-header"><b><span class="stgcmodes_i18n" data-key="panelTitle"></span></b><div class="inline-drawer-icon fa-solid fa-circle-chevron-up up"></div></div>',
         '<div class="inline-drawer-content" id="stgcmodes_content">',
         '<label class="flex1 checkbox_label" id="stgcmodes_enabled_row" for="stgcmodes_enabled"><input id="stgcmodes_enabled" type="checkbox" /><span class="stgcmodes_i18n" data-key="enabledLabel"></span></label>',
         '<div class="stgcmodes_repo_row"><a id="stgcmodes_repo_link" href="https://github.com/DarkLeopard/st-gc-modes" target="_blank" rel="noopener"><span class="stgcmodes_i18n" data-key="repoLink"></span></a></div>',
