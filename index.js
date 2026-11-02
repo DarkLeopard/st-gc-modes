@@ -73,6 +73,8 @@ const UI_TEXT = {
         groupAliasFillTitle: 'For every member without aliases, the model reads their description and writes a generated alias list into their character card (saved immediately).',
         bulkProgressToast: 'Generating aliases: {current} of {total}…',
         bulkDoneToast: 'Aliases filled: {ok} of {total} members.',
+        bulkNothingToast: 'All members already have aliases',
+        bulkBusyLabel: 'Generating…',
         bulkMemberFailedToast: 'st-gc-modes: aliases for {name} failed — skipped',
         toggleOffToast: 'st-gc-modes disabled: Smart/Alias options hidden', toggleOnToast: 'st-gc-modes enabled',
         ttEnabled: 'Master switch. When off, the extension removes its Smart/Alias options and the per-group cap widget and stops reacting to messages; the panel itself stays available.',
@@ -113,6 +115,8 @@ const UI_TEXT = {
         groupAliasFillTitle: 'Для каждого участника без алиасов модель читает его описание и записывает сгенерированный список алиасов в его карточку (сразу сохраняет).',
         bulkProgressToast: 'Генерирую алиасы: {current} из {total}…',
         bulkDoneToast: 'Алиасы заполнены: {ok} из {total} участников.',
+        bulkNothingToast: 'Алиасы уже заданы у всех участников',
+        bulkBusyLabel: 'Генерирую…',
         bulkMemberFailedToast: 'st-gc-modes: не удалось для {name} — пропущен',
         toggleOffToast: 'st-gc-modes выключен: пункты Smart/Alias скрыты', toggleOnToast: 'st-gc-modes включён',
         ttEnabled: 'Главный выключатель. Когда выключено, расширение убирает свои пункты Smart/Alias и виджет лимита группы и перестаёт реагировать на сообщения; сама панель остаётся доступной.',
@@ -1454,12 +1458,14 @@ function showBulkMemberFailedToast(name) {
 }
 
 /** Click handler for the group alias widget's "Fill with LLM" button: for every enabled member of the active group
- * that still has no aliases (existing character only), one quiet generateRaw request over buildAliasPrompt, parsed
- * by parseAliasAnswer and saved straight into the character card through saveCharacterAliases (programmatic FULL
- * form save + in-place single-character refresh). Members run strictly sequentially like the invokeMembers loop;
- * every per-member failure is a toast + skip (never a throw out of the loop) and the run always ends with the
- * bulkDoneToast; the busy flag and the button state are restored in finally — syncGroupAliasWarning recomputes
- * both the now-possibly-empty missing list and the disabled state (the widget disappears or shows "all set").
+ * that still has no CARD aliases (existing character only; legacy-only members qualify — the fill migrates them),
+ * one quiet generateRaw request over buildAliasPrompt, parsed by parseAliasAnswer and saved straight into the
+ * character card through saveCharacterAliases (programmatic FULL form save + in-place single-character refresh).
+ * Members run strictly sequentially like the invokeMembers loop; every per-member failure is a toast + skip (never a
+ * throw out of the loop) and the run always ends with the bulkDoneToast; a zero-target run answers with the
+ * bulkNothingToast and never starts; while the run is in flight the button label switches to bulkBusyLabel (the
+ * original caption is restored in finally together with the busy flag and the button state — syncGroupAliasWarning
+ * recomputes both the now-possibly-empty missing list and the disabled state).
  * @returns {Promise<void>} Resolves once the run finished. */
 async function onBulkAliasFill() {
     if (!isEnabled() || bulkAliasFillBusy) return;
@@ -1471,10 +1477,19 @@ async function onBulkAliasFill() {
     const strategy = Number(group.activation_strategy);
     if (strategy !== STRATEGY_SMART && strategy !== STRATEGY_ALIAS) return;
     const targets = membersWithoutAliases(group);
-    if (targets.length === 0) return;
+    if (targets.length === 0) {
+        console.warn(LOG_PREFIX, 'bulk alias fill skipped: all members already have card aliases');
+        if (typeof toastr !== 'undefined' && typeof toastr.info === 'function') {
+            toastr.info(localize('bulkNothingToast'), MODULE_NAME);
+        }
+        return;
+    }
     bulkAliasFillBusy = true;
+    const fillLabel = $('#stgcmodes_group_aliaswarn_fill span').first();
+    const originalLabel = String(fillLabel.text() ?? '');
     try {
         $('#stgcmodes_group_aliaswarn_fill').prop('disabled', true); // queried by id each time: the widget can be re-injected
+        fillLabel.text(localize('bulkBusyLabel'));
         let ok = 0;
         for (let i = 0; i < targets.length; i++) {
             const avatar = targets[i];
@@ -1517,6 +1532,7 @@ async function onBulkAliasFill() {
             toastr.info(localize('bulkDoneToast').replace('{ok}', () => String(ok)).replace('{total}', () => String(targets.length)), MODULE_NAME);
         }
     } finally {
+        $('#stgcmodes_group_aliaswarn_fill span').first().text(originalLabel); // busy label back to the original caption
         bulkAliasFillBusy = false;
         syncGroupAliasWarning(); // recomputes the missing list (now possibly empty) and the button disabled state
     }
